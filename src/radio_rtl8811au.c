@@ -4,6 +4,23 @@
 #include <string.h>
 #include "radio_rtl8811au.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#define rtl_sleep_ms(ms) Sleep(ms)
+#else
+#include <unistd.h>
+#define rtl_sleep_ms(ms) usleep((ms) * 1000)
+#endif
+
+/* ================================================================
+ * Embedded firmware blob (extracted from Linux driver hal8821a_fw.c)
+ * Size: 30880 bytes
+ * ================================================================ */
+static const uint8_t rtl_firmware[] = {
+#include "../firmware/rtl8811au_fw.h"
+};
+static const size_t rtl_firmware_len = sizeof(rtl_firmware);
+
 /* ================================================================
  * Static helpers — USB register access
  * ================================================================ */
@@ -124,6 +141,210 @@ static int rtl_read_mac(rtl8811au_priv_t *priv)
 }
 
 /* ================================================================
+ * Firmware upload + PHY init
+ * Based on Linux driver core/rtw_fw.c and hal/rtl8811au/ sources.
+ * Register addresses and bit positions are from the driver; they MAY
+ * need adjustment during hardware testing on actual silicon.
+ * ================================================================ */
+
+/* Firmware register addresses (from rtw_fw.c / rtl8821a) */
+#define REG_MCUFWDL       0x0080   /* MCU firmware download control */
+#define REG_MCUFWDL_PAGE  0x0081   /* Firmware page register (high addr bits) */
+#define REG_8051FW_CTRL   0x0082   /* 8051 CPU reset/start control */
+#define RTL_FW_BLOCK_SIZE 4096     /* Download block size */
+#define RTL_FW_BASE_ADDR  0x1000   /* USB control transfer base address */
+
+#define REG_CHANNEL       0x0018   /* RF channel register */
+#define REG_RX_FILTER_0   0x0608   /* RX filter control register 0 */
+#define REG_RX_FILTER_1   0x060C   /* RX filter control register 1 */
+
+/*
+ * rtl_fw_download — Upload firmware blob to the 8051 co-processor.
+ *
+ * Sequence (from Linux driver rtw_fw.c):
+ *   1. Enable MCUFWDL (reg 0x0080 bit 0)
+ *   2. Reset 8051 CPU (reg 0x0082 clear bit 3)
+ *   3. Write firmware in 4096-byte blocks via control transfer at 0x1000+offset
+ *   4. For addresses > 0xFFFF, set page register at 0x0081
+ *   5. Clear MCUFWDL enable (reg 0x0080 clear bit 0)
+ *   6. Start 8051 (reg 0x0082 set bit 3)
+ *   7. Poll WINTINI_RDY (reg 0x0080 bit 7) for up to 100 attempts
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+static int rtl_fw_download(rtl8811au_priv_t *priv)
+{
+    uint8_t reg_val;
+    size_t offset;
+    size_t block_len;
+    int i, rc;
+
+    printf("[RTL8811AU] Firmware upload: %u bytes\n", (unsigned)rtl_firmware_len);
+
+    /* Step 1: Enable MCUFWDL — set bit 0 of reg 0x0080 */
+    rc = rtl_read_reg8(priv, REG_MCUFWDL, &reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to read MCUFWDL register\n");
+        return -1;
+    }
+    reg_val |= 0x01;  /* MCUFWDL enable = bit 0 */
+    rc = rtl_write_reg8(priv, REG_MCUFWDL, reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to enable MCUFWDL\n");
+        return -1;
+    }
+    printf("  FW: MCUFWDL enabled\n");
+
+    /* Step 2: Reset 8051 CPU — clear bit 3 of reg 0x0082 */
+    rc = rtl_read_reg8(priv, REG_8051FW_CTRL, &reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to read 8051 control register\n");
+        return -1;
+    }
+    reg_val &= ~0x08;  /* Clear bit 3 = hold 8051 in reset */
+    rc = rtl_write_reg8(priv, REG_8051FW_CTRL, reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to reset 8051\n");
+        return -1;
+    }
+    printf("  FW: 8051 held in reset\n");
+
+    /* Step 3+4: Download firmware in blocks */
+    for (offset = 0; offset < rtl_firmware_len; offset += RTL_FW_BLOCK_SIZE) {
+        block_len = rtl_firmware_len - offset;
+        if (block_len > RTL_FW_BLOCK_SIZE)
+            block_len = RTL_FW_BLOCK_SIZE;
+
+        /* If address exceeds 16 bits, update the page register (0x0081) */
+        uint16_t dl_addr = (uint16_t)((RTL_FW_BASE_ADDR + offset) & 0xFFFF);
+        uint8_t page = (uint8_t)(((RTL_FW_BASE_ADDR + offset) >> 16) & 0xFF);
+        if (page != 0) {
+            rc = rtl_write_reg8(priv, REG_MCUFWDL_PAGE, page);
+            if (rc < 0) {
+                fprintf(stderr, "  FW: failed to set page register at offset %u\n",
+                        (unsigned)offset);
+                return -1;
+            }
+        }
+
+        /* Write the block via control transfer */
+        rc = rtl_write_reg(priv, dl_addr,
+                           rtl_firmware + offset, (uint16_t)block_len);
+        if (rc < 0) {
+            fprintf(stderr, "  FW: block write failed at offset %u\n",
+                    (unsigned)offset);
+            return -1;
+        }
+
+        printf("  FW: block %u/%u (%u bytes)\n",
+               (unsigned)(offset / RTL_FW_BLOCK_SIZE + 1),
+               (unsigned)((rtl_firmware_len + RTL_FW_BLOCK_SIZE - 1) / RTL_FW_BLOCK_SIZE),
+               (unsigned)block_len);
+    }
+
+    /* Reset page register if we changed it */
+    rtl_write_reg8(priv, REG_MCUFWDL_PAGE, 0);
+
+    /* Step 5: Clear MCUFWDL enable — clear bit 0 of reg 0x0080 */
+    rc = rtl_read_reg8(priv, REG_MCUFWDL, &reg_val);
+    if (rc < 0) return -1;
+    reg_val &= ~0x01;
+    rc = rtl_write_reg8(priv, REG_MCUFWDL, reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to clear MCUFWDL\n");
+        return -1;
+    }
+
+    /* Step 6: Start 8051 — set bit 3 of reg 0x0082 */
+    rc = rtl_read_reg8(priv, REG_8051FW_CTRL, &reg_val);
+    if (rc < 0) return -1;
+    reg_val |= 0x08;  /* Set bit 3 = release 8051 from reset */
+    rc = rtl_write_reg8(priv, REG_8051FW_CTRL, reg_val);
+    if (rc < 0) {
+        fprintf(stderr, "  FW: failed to start 8051\n");
+        return -1;
+    }
+    printf("  FW: 8051 started, polling for ready...\n");
+
+    /* Step 7: Poll WINTINI_RDY (bit 7 of reg 0x0080) */
+    for (i = 0; i < 100; i++) {
+        rtl_sleep_ms(10);
+        rc = rtl_read_reg8(priv, REG_MCUFWDL, &reg_val);
+        if (rc < 0) return -1;
+        if (reg_val & 0x80) {  /* WINTINI_RDY = bit 7 */
+            printf("  FW: firmware ready (poll %d)\n", i + 1);
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "  FW: timeout waiting for WINTINI_RDY after 1000ms\n");
+    return -1;
+}
+
+/*
+ * rtl_set_channel_regs — Write RF channel to hardware registers.
+ *
+ * For 2.4 GHz channels 1-13: freq = ch * 5 + 2407 MHz
+ * Channel 14: freq = 2484 MHz
+ * NOTE: This is a simplified version. The full driver writes additional
+ * PHY/RF registers per channel. Enough for initial hardware testing.
+ */
+static int rtl_set_channel_regs(rtl8811au_priv_t *priv, uint8_t ch)
+{
+    int freq;
+    int rc;
+
+    if (ch < 1 || ch > 14) {
+        fprintf(stderr, "[RTL8811AU] Invalid channel %d (must be 1-14)\n", ch);
+        return -1;
+    }
+
+    /* Calculate frequency */
+    freq = (ch == 14) ? 2484 : (ch * 5 + 2407);
+
+    /* Write channel number to hardware */
+    rc = rtl_write_reg8(priv, REG_CHANNEL, ch);
+    if (rc < 0) {
+        fprintf(stderr, "  Failed to set channel register\n");
+        return -1;
+    }
+
+    printf("[RTL8811AU] Channel %d (%d MHz)\n", ch, freq);
+    return 0;
+}
+
+/*
+ * rtl_set_monitor_mode — Configure RX filters to accept all frames.
+ *
+ * Writes 0xFFFFFFFF to RX filter registers to disable all frame filtering,
+ * which is needed for monitor / promiscuous mode operation.
+ * NOTE: The full driver does much more for monitor mode (disabling CRC
+ * checks, setting specific PHY registers, etc.). This is sufficient for
+ * initial hardware testing.
+ */
+static int rtl_set_monitor_mode(rtl8811au_priv_t *priv)
+{
+    int rc;
+
+    /* Accept all frames — RX filter 0 */
+    rc = rtl_write_reg32(priv, REG_RX_FILTER_0, 0xFFFFFFFF);
+    if (rc < 0) {
+        fprintf(stderr, "  Failed to set RX filter register 0\n");
+        return -1;
+    }
+
+    /* Accept all frames — RX filter 1 */
+    rc = rtl_write_reg32(priv, REG_RX_FILTER_1, 0xFFFFFFFF);
+    if (rc < 0) {
+        fprintf(stderr, "  Failed to set RX filter register 1\n");
+        return -1;
+    }
+
+    printf("[RTL8811AU] Monitor mode enabled (all-pass RX filter)\n");
+    return 0;
+}
+
+/* ================================================================
  * Radio vtable functions
  * ================================================================ */
 
@@ -172,10 +393,24 @@ static int rtl_init(radio_t *r)
     }
     printf("  Claimed interface 0\n");
 
+    /* Upload firmware to 8051 co-processor */
+    if (rtl_fw_download(priv) < 0) {
+        fprintf(stderr, "  Warning: Firmware upload failed (may already be loaded)\n");
+        /* Not fatal — device may have firmware in flash or loaded by OS driver */
+    }
+
+    /* Set default channel and enable monitor mode */
+    if (rtl_set_channel_regs(priv, 1) < 0) {
+        fprintf(stderr, "  Warning: Default channel set failed\n");
+    }
+    if (rtl_set_monitor_mode(priv) < 0) {
+        fprintf(stderr, "  Warning: Monitor mode setup failed\n");
+    }
+
     /* Read MAC address */
     if (rtl_read_mac(priv) < 0) {
-        fprintf(stderr, "  Warning: Could not read MAC (firmware may not be loaded yet)\n");
-        /* Not fatal — MAC read will work after firmware upload in Task 6 */
+        fprintf(stderr, "  Warning: Could not read MAC address\n");
+        /* Not fatal — continue init, device may still be usable */
     }
 
     priv->channel = 1;
@@ -190,9 +425,11 @@ static int rtl_init(radio_t *r)
 static int rtl_set_channel(radio_t *r, uint8_t ch)
 {
     rtl8811au_priv_t *priv = (rtl8811au_priv_t *)r->priv;
+
+    if (rtl_set_channel_regs(priv, ch) < 0) {
+        return -1;
+    }
     priv->channel = ch;
-    printf("[RTL8811AU] Channel set to %d (register write deferred to PHY init)\n", ch);
-    /* Actual register write comes in Task 6 (firmware + PHY init) */
     return 0;
 }
 
@@ -303,13 +540,8 @@ int rtl8811au_create(radio_t *r)
     return 0;
 }
 
-/* Suppress unused-function warnings for convenience wrappers
-   that will be used by Task 6 (firmware upload + PHY init) */
+/* Note: rtl_write_reg16 is available but not yet used — suppress warning */
 static void rtl_suppress_unused_warnings_(void) {
-    (void)rtl_write_reg8;
     (void)rtl_write_reg16;
-    (void)rtl_write_reg32;
-    (void)rtl_read_reg8;
-    (void)rtl_read_reg32;
     (void)rtl_suppress_unused_warnings_;
 }
