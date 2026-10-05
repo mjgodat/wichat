@@ -4,6 +4,8 @@
 #include <string.h>
 #include "config.h"
 #include "frame.h"
+#include "radio.h"
+#include "radio_rtl8811au.h"
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -39,6 +41,32 @@ int main(int argc, char **argv) {
         printf("Decode: %s\n", rc == 0 ? "OK" : "FAIL");
         printf("Payload: %s\n", (const char *)rx.payload);
         printf("TTL: %d, Type: 0x%02x\n", rx.hdr.ttl, rx.hdr.type);
+    }
+
+    /* ---- RTL8811AU radio test ---- */
+    printf("\n--- RTL8811AU USB Radio ---\n");
+    {
+        radio_t radio;
+        int rc = rtl8811au_create(&radio);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to create radio object\n");
+            return 1;
+        }
+
+        rc = radio.init(&radio);
+        if (rc != 0) {
+            printf("Radio init failed -- running in offline mode\n");
+        } else {
+            rtl8811au_priv_t *priv = (rtl8811au_priv_t *)radio.priv;
+            printf("Radio online! MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   priv->local_mac[0], priv->local_mac[1], priv->local_mac[2],
+                   priv->local_mac[3], priv->local_mac[4], priv->local_mac[5]);
+
+            printf("Press Enter to shutdown...\n");
+            getchar();
+
+            radio.shutdown(&radio);
+        }
     }
 
     return 0;
