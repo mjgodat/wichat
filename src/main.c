@@ -1,73 +1,121 @@
-/* main.c — WiChat entry point */
+/* main.c -- WiChat entry point */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include "config.h"
 #include "frame.h"
 #include "radio.h"
 #include "radio_rtl8811au.h"
+#include "mesh.h"
+#include "gui.h"
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+static uint32_t get_ms(void)
+{
+#ifdef _WIN32
+    return (uint32_t)GetTickCount();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
+}
+
+int main(int argc, char **argv)
+{
+    const char *callsign = WICHAT_DEFAULT_NAME;
+    radio_t radio;
+    mesh_t mesh;
+    gui_ctx_t gui;
+    int radio_online = 0;
+    int i;
 
     printf("WiChat v%s\n", WICHAT_VERSION);
-    printf("Channel: %d\n", WICHAT_DEFAULT_CH);
 
-    /* ---- Wire format self-test ---- */
-    {
-        uint8_t fake_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01};
-        const char *msg = "Hello mesh!";
-
-        /* Build a chat frame */
-        wichat_frame_t tx;
-        memset(&tx, 0, sizeof(tx));
-        tx.hdr.magic  = WICHAT_MAGIC;
-        tx.hdr.msg_id = frame_gen_msg_id();
-        tx.hdr.ttl    = WICHAT_DEFAULT_TTL;
-        tx.hdr.type   = WICHAT_TYPE_CHAT;
-        memcpy(tx.hdr.sender, fake_mac, 6);
-        tx.payload_len = strlen(msg);
-        memcpy(tx.payload, msg, tx.payload_len);
-
-        /* Encode */
-        uint8_t wire[512];
-        int enc_len = frame_encode(&tx, fake_mac, wire, sizeof(wire));
-        printf("Encoded frame: %d bytes\n", enc_len);
-
-        /* Decode */
-        wichat_frame_t rx;
-        memset(&rx, 0, sizeof(rx));
-        int rc = frame_decode(wire, (size_t)enc_len, &rx);
-        printf("Decode: %s\n", rc == 0 ? "OK" : "FAIL");
-        printf("Payload: %s\n", (const char *)rx.payload);
-        printf("TTL: %d, Type: 0x%02x\n", rx.hdr.ttl, rx.hdr.type);
+    /* Parse --name argument */
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            callsign = argv[++i];
+        }
     }
 
-    /* ---- RTL8811AU radio test ---- */
-    printf("\n--- RTL8811AU USB Radio ---\n");
-    {
-        radio_t radio;
-        int rc = rtl8811au_create(&radio);
-        if (rc != 0) {
-            fprintf(stderr, "Failed to create radio object\n");
-            return 1;
-        }
-
-        rc = radio.init(&radio);
-        if (rc != 0) {
-            printf("Radio init failed -- running in offline mode\n");
+    /* ---- Create radio (fall back to offline mode) ---- */
+    memset(&radio, 0, sizeof(radio));
+    if (rtl8811au_create(&radio) == 0) {
+        if (radio.init(&radio) == 0) {
+            radio_online = 1;
+            printf("Radio online.\n");
         } else {
-            rtl8811au_priv_t *priv = (rtl8811au_priv_t *)radio.priv;
-            printf("Radio online! MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   priv->local_mac[0], priv->local_mac[1], priv->local_mac[2],
-                   priv->local_mac[3], priv->local_mac[4], priv->local_mac[5]);
-
-            printf("Press Enter to shutdown...\n");
-            getchar();
-
-            radio.shutdown(&radio);
+            printf("Radio init failed -- offline mode.\n");
         }
+    } else {
+        printf("Radio create failed -- offline mode.\n");
     }
 
+    /* ---- Init mesh ---- */
+    mesh_init(&mesh, radio_online ? &radio : NULL, callsign);
+
+    /* Copy MAC from radio if available, else generate random */
+    if (radio_online) {
+        rtl8811au_priv_t *priv = (rtl8811au_priv_t *)radio.priv;
+        memcpy(mesh.local_mac, priv->local_mac, 6);
+    } else {
+        /* Random MAC for offline mode */
+        uint32_t seed = get_ms();
+        mesh.local_mac[0] = 0x02; /* locally administered */
+        mesh.local_mac[1] = (uint8_t)(seed >> 0);
+        mesh.local_mac[2] = (uint8_t)(seed >> 8);
+        mesh.local_mac[3] = (uint8_t)(seed >> 16);
+        mesh.local_mac[4] = (uint8_t)(seed >> 24);
+        mesh.local_mac[5] = (uint8_t)(seed * 7);
+    }
+
+    printf("MAC: %02x:%02x:%02x:%02x:%02x:%02x  Callsign: %s\n",
+        mesh.local_mac[0], mesh.local_mac[1], mesh.local_mac[2],
+        mesh.local_mac[3], mesh.local_mac[4], mesh.local_mac[5],
+        mesh.callsign);
+
+    /* ---- Init GUI ---- */
+    if (gui_init(&gui, &mesh) != 0) {
+        fprintf(stderr, "GUI init failed.\n");
+        if (radio_online) radio.shutdown(&radio);
+        return 1;
+    }
+
+    /* ---- Main loop ---- */
+    while (gui.running) {
+        uint32_t now_ms = get_ms();
+
+        /* Poll radio for incoming frame */
+        if (radio_online) {
+            uint8_t rx_buf[512];
+            int rx_len = radio.rx_frame(&radio, rx_buf, sizeof(rx_buf), 1);
+            if (rx_len > 0) {
+                mesh_process_rx(&mesh, rx_buf, (size_t)rx_len, 0);
+                gui.scroll_to_bottom = 1;
+            }
+        }
+
+        /* Mesh housekeeping */
+        mesh_tick(&mesh, now_ms);
+
+        /* Render one GUI frame */
+        if (gui_frame(&gui) < 0)
+            break;
+
+        /* Yield CPU */
+        Sleep(1);
+    }
+
+    /* ---- Cleanup ---- */
+    gui_shutdown(&gui);
+    if (radio_online) radio.shutdown(&radio);
+
+    printf("WiChat shutdown.\n");
     return 0;
 }

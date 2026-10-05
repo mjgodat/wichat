@@ -13,7 +13,7 @@ cl /nologo /O2 /W3 ^
     src\radio_rtl8811au.c src\gui.c ^
     lib\tinycrypt\aes_encrypt.c lib\tinycrypt\ccm_mode.c lib\tinycrypt\utils.c ^
     /Fe:build\wichat.exe ^
-    /link user32.lib gdi32.lib lib\libusb\libusb-1.0.lib
+    /link user32.lib gdi32.lib msimg32.lib lib\libusb\libusb-1.0.lib
 
 if %ERRORLEVEL% EQU 0 (
     copy /Y lib\libusb-1.0.dll build\ >nul 2>&1
