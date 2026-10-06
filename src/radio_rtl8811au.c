@@ -390,8 +390,8 @@ static int rtl_fw_download(rtl8811au_priv_t *priv)
     rtl_write_reg8(priv, REG_MCUFWDL, reg_val);
 
     /* Step 6: Poll checksum report — bit 2 of reg 0x0080 (FWDL_ChkSum_rpt) */
-    printf("  FW: polling checksum...\n");
-    for (i = 0; i < 200; i++) {
+    printf("  FW: polling checksum (up to 10s)...\n");
+    for (i = 0; i < 1000; i++) {
         uint32_t val32;
         rc = rtl_read_reg32(priv, REG_MCUFWDL, &val32);
         if (rc < 0) return -1;
@@ -445,8 +445,10 @@ static int rtl_fw_download(rtl8811au_priv_t *priv)
     }
     printf("  FW: 8051 reset complete, polling WINTINI_RDY...\n");
 
-    /* Step 9: Poll WINTINI_RDY (bit 6 of 32-bit reg 0x0080) */
-    for (i = 0; i < 200; i++) {
+    /* Step 9: Poll WINTINI_RDY (bit 6 of 32-bit reg 0x0080)
+     * RTL8821A 8051 can take 2-3 seconds to complete startup.
+     * Poll for 10 full seconds before declaring failure. */
+    for (i = 0; i < 1000; i++) {
         uint32_t val32;
         rc = rtl_read_reg32(priv, REG_MCUFWDL, &val32);
         if (rc < 0) return -1;
@@ -578,37 +580,122 @@ static int rtl_init(radio_t *r)
     }
     printf("  Claimed interface 0\n");
 
-    /* Strategy: the Realtek Windows driver already initialized this chip
-     * (firmware, DMA, TX queues, etc.) before Zadig rebind. Don't overwrite
-     * that working state. Just read current config and set monitor mode. */
+    /* ---- Step 0: USB device reset for clean state ---- */
+    printf("  Resetting USB device...\n");
+    rc = libusb_reset_device(priv->dev);
+    if (rc != 0) {
+        fprintf(stderr, "  USB reset: %s (continuing anyway)\n", libusb_error_name(rc));
+        /* Re-claim interface after reset */
+    }
+    /* Re-claim interface (reset releases it) */
+    libusb_claim_interface(priv->dev, 0);
+    rtl_sleep_ms(100);
+
+    /* ---- Step 1: Dump chip state after reset ---- */
     {
-        uint32_t mcufwdl, reg_cr;
+        uint32_t mcufwdl, reg_cr, aps_fsmco;
+        uint8_t reg05;
         rtl_read_reg32(priv, REG_MCUFWDL, &mcufwdl);
         rtl_read_reg32(priv, 0x0100, &reg_cr);
-        printf("  Chip state: MCUFWDL=0x%08x REG_CR=0x%08x\n", mcufwdl, reg_cr);
+        rtl_read_reg32(priv, 0x0004, &aps_fsmco);
+        rtl_read_reg8(priv, 0x0005, &reg05);
+        printf("  After reset: MCUFWDL=0x%08x CR=0x%08x APS=0x%08x R05=0x%02x\n",
+               mcufwdl, reg_cr, aps_fsmco, reg05);
+    }
 
-        if (mcufwdl & 0x02)
-            printf("  Firmware: LOADED (preserving Realtek driver state)\n");
-        else {
-            printf("  Firmware: NOT loaded — running power-on + upload\n");
-            if (rtl_power_on(priv) < 0)
-                fprintf(stderr, "  Warning: Power-on failed\n");
-            if (rtl_fw_download(priv) < 0)
-                fprintf(stderr, "  Warning: Firmware upload failed\n");
+    /* ---- Step 2: Full power-on (always, ignore stale MCUFWDL_RDY) ---- */
+    printf("  Running full power-on sequence...\n");
+    rtl_power_on(priv);
+
+    /* ---- Step 3: Upload firmware (always, don't trust stale state) ---- */
+    printf("  Uploading firmware...\n");
+    if (rtl_fw_download(priv) < 0) {
+        fprintf(stderr, "  Firmware upload failed - chip may not be fully operational\n");
+    }
+
+    /* ---- Step 3: Enable MAC/DMA blocks ---- */
+    rtl_write_reg16(priv, 0x0100, 0x02FF);  /* REG_CR: enable MAC/WMAC/SEC */
+    printf("  MAC/DMA blocks enabled\n");
+
+    /* ---- Step 4: Queue page buffer partition (CRITICAL for TX) ----
+     * Without this, TX DMA has no memory and NAKs all bulk OUT.
+     * Total buffer: 196 pages (0xC4), 128 bytes each.
+     * Allocate: HI=4, MGT=8, rest=RX */
+    rtl_write_reg32(priv, 0x0014, 0x00000000);  /* RQPN: VO=0,VI=0,BE=0,BK=0 */
+    rtl_write_reg8(priv, 0x0208, 0xC4);         /* BCN boundary at end */
+    rtl_write_reg8(priv, 0x0209, 0x0C);         /* MGT queue boundary */
+    rtl_write_reg8(priv, 0x020A, 0x0C);         /* WMAC loopback boundary */
+    rtl_write_reg8(priv, 0x020B, 0x04);         /* WMM boundary: HI ends at page 4 */
+    rtl_write_reg16(priv, 0x0218, 0x0408);       /* RQPN_NPQ: HI=4, MGT=8 pages */
+    rtl_write_reg8(priv, 0x021A, 0x0C);         /* RXPKTBUF_BDNY: RX starts at page 12 */
+    printf("  TX queue page buffers configured (HI=4, MGT=8, RX from page 12)\n");
+
+    /* ---- Step 5: TRXDMA queue-to-endpoint mapping ---- */
+    rtl_write_reg16(priv, 0x010C, 0xF5B1);      /* Standard USB 2-EP mapping */
+    printf("  TRXDMA queue mapping set\n");
+
+    /* ---- Step 6: Enable MAC TRX ---- */
+    rtl_write_reg8(priv, 0x0100, 0xFF);          /* Enable all WMAC TRX */
+    rtl_write_reg8(priv, 0x0101, 0x03);          /* Enable MAC TRX */
+    rtl_write_reg16(priv, 0x0522, 0x0000);       /* Clear TX pause */
+    printf("  MAC TRX enabled, TX pause cleared\n");
+
+    /* ---- Step 7: RCR for monitor mode ----
+     * 0xFFFFFFFF is WRONG - CBSSID bit restricts reception.
+     * Set only the bits we need. */
+    {
+        uint32_t rcr = 0;
+        rcr |= (1 << 0);   /* AAP: accept all physical address */
+        rcr |= (1 << 1);   /* APM: accept physical match */
+        rcr |= (1 << 2);   /* AM: accept multicast */
+        rcr |= (1 << 3);   /* AB: accept broadcast */
+        rcr |= (1 << 5);   /* ACRC32: accept CRC error frames */
+        rcr |= (1u << 31); /* APPFCS: append FCS */
+        rtl_write_reg32(priv, 0x0608, rcr);
+        printf("  RCR set for monitor mode (0x%08x)\n", rcr);
+    }
+
+    /* ---- Step 8: EFUSE autoload for MAC ---- */
+    {
+        uint8_t val;
+        rtl_read_reg8(priv, 0x0001, &val);
+        rtl_write_reg8(priv, 0x0001, val | 0x08);  /* trigger EFUSE autoload */
+        rtl_sleep_ms(20);
+    }
+
+    /* ---- Step 9: Set channel ---- */
+    rtl_set_channel_regs(priv, 1);
+
+    /* ---- Step 10: Dump endpoint mapping for debug ---- */
+    {
+        struct libusb_config_descriptor *cfg = NULL;
+        int ep_rc = libusb_get_config_descriptor(
+            libusb_get_device(priv->dev), 0, &cfg);
+        if (ep_rc == 0 && cfg) {
+            const struct libusb_interface_descriptor *alt =
+                &cfg->interface[0].altsetting[0];
+            int ei;
+            printf("  USB endpoints (%d):\n", alt->bNumEndpoints);
+            for (ei = 0; ei < alt->bNumEndpoints; ei++) {
+                const struct libusb_endpoint_descriptor *ep = &alt->endpoint[ei];
+                printf("    EP 0x%02x %s %s maxpkt=%d\n",
+                    ep->bEndpointAddress,
+                    (ep->bEndpointAddress & 0x80) ? "IN " : "OUT",
+                    (ep->bmAttributes & 0x03) == 2 ? "BULK" : "OTHER",
+                    ep->wMaxPacketSize);
+            }
+            libusb_free_config_descriptor(cfg);
         }
     }
 
-    /* Set monitor mode — accept all frames */
-    rtl_set_monitor_mode(priv);
-
-    /* Try a raw bulk IN read to see if we receive anything */
-    printf("  Testing RX (5 second listen)...\n");
+    /* ---- RX test (3 seconds) ---- */
+    printf("  Testing RX (3 second listen)...\n");
     {
         uint8_t rx_test[2048];
         int actual = 0;
         int total_rx = 0;
         int i, rc2;
-        for (i = 0; i < 50; i++) {  /* 50 x 100ms = 5 seconds */
+        for (i = 0; i < 30; i++) {
             actual = 0;
             rc2 = libusb_bulk_transfer(priv->dev, RTL_EP_BULK_IN,
                 rx_test, (int)sizeof(rx_test), &actual, 100);
@@ -629,7 +716,7 @@ static int rtl_init(radio_t *r)
                 }
             }
         }
-        printf("  RX test done: %d frames in 5 seconds\n", total_rx);
+        printf("  RX test done: %d frames in 3 seconds\n", total_rx);
     }
 
     /* Read MAC address */
@@ -697,6 +784,7 @@ static void rtl_build_txdesc(uint8_t *desc, size_t pkt_len)
     dw0 |= (1 << 24);                  /* bmc = 1 (broadcast) */
     dw0 |= (1 << 26);                  /* ls = 1 (last segment) */
     dw0 |= (1 << 27);                  /* fs = 1 (first segment) */
+    dw0 |= (1u << 31);                 /* OWN = 1 (hand to hardware) */
     desc[0] = (uint8_t)(dw0);
     desc[1] = (uint8_t)(dw0 >> 8);
     desc[2] = (uint8_t)(dw0 >> 16);
