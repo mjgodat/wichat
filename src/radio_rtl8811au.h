@@ -14,9 +14,9 @@ static const struct { uint16_t vid; uint16_t pid; const char *name; } RTL_DEVICE
     {0, 0, NULL}
 };
 
-/* ---- USB endpoints ---- */
-#define RTL_EP_BULK_OUT  0x02
-#define RTL_EP_BULK_IN   0x81
+/* ---- USB endpoints (enumerated from actual device) ---- */
+#define RTL_EP_BULK_OUT  0x05
+#define RTL_EP_BULK_IN   0x84
 
 /* ---- Register access via vendor control transfers ---- */
 #define RTL_REQ_READ     0x05

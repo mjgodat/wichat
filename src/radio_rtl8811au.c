@@ -478,7 +478,14 @@ static int rtl_rx_frame(radio_t *r, uint8_t *buf, size_t max_len, int timeout_ms
         return 0;  /* timeout — no data */
     }
     if (rc != 0) {
-        fprintf(stderr, "rtl_rx_frame: %s\n", libusb_error_name(rc));
+        /* Only log non-timeout errors once to avoid spam */
+        static int rx_err_count = 0;
+        if (rx_err_count < 3) {
+            fprintf(stderr, "rtl_rx_frame: %s\n", libusb_error_name(rc));
+            rx_err_count++;
+            if (rx_err_count == 3)
+                fprintf(stderr, "  (suppressing further RX errors)\n");
+        }
         return -1;
     }
     return actual;
