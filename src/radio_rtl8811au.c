@@ -154,9 +154,120 @@ static int rtl_read_mac(rtl8811au_priv_t *priv)
 #define RTL_FW_BLOCK_SIZE 4096     /* Download block size */
 #define RTL_FW_BASE_ADDR  0x1000   /* USB control transfer base address */
 
+#define REG_SYS_FUNC_EN   0x0002   /* System function enable */
 #define REG_CHANNEL       0x0018   /* RF channel register */
 #define REG_RX_FILTER_0   0x0608   /* RX filter control register 0 */
 #define REG_RX_FILTER_1   0x060C   /* RX filter control register 1 */
+
+/*
+ * rtl_power_on — RTL8821A CARDEMU_TO_ACT power-on sequence.
+ * Ported from Hal8821APwrSeq.h RTL8821A_TRANS_CARDEMU_TO_ACT.
+ * Only USB-relevant steps are included.
+ *
+ * This MUST run before firmware upload.
+ */
+static int rtl_power_on(rtl8811au_priv_t *priv)
+{
+    uint8_t val;
+    int i, rc;
+
+    printf("[RTL8811AU] Power-on sequence...\n");
+
+    /* 0x20[0] = 1 — enable LDOA12 MACRO block */
+    rc = rtl_read_reg8(priv, 0x0020, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0020, val | 0x01);
+
+    /* 0x67[4] = 0 — disable BT_GPS_SEL pins */
+    rc = rtl_read_reg8(priv, 0x0067, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0067, val & ~0x10);
+
+    /* Delay 1ms */
+    rtl_sleep_ms(1);
+
+    /* 0x00[5] = 0 — release analog IPs to digital */
+    rc = rtl_read_reg8(priv, 0x0000, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0000, val & ~0x20);
+
+    /* 0x05[4:2] = 0 — disable SW LPS and WLSUS_EN */
+    rc = rtl_read_reg8(priv, 0x0005, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0005, val & ~0x1C);
+
+    /* Poll 0x06[1] == 1 — wait for power ready */
+    printf("  Polling power ready...\n");
+    for (i = 0; i < 200; i++) {
+        rc = rtl_read_reg8(priv, 0x0006, &val); if (rc < 0) return -1;
+        if (val & 0x02) break;
+        rtl_sleep_ms(5);
+    }
+    if (!(val & 0x02)) {
+        fprintf(stderr, "  Power ready timeout\n");
+        return -1;
+    }
+    printf("  Power ready (poll %d)\n", i + 1);
+
+    /* 0x06[0] = 1 — release WLON reset */
+    rc = rtl_read_reg8(priv, 0x0006, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0006, val | 0x01);
+
+    /* 0x05[7] = 0 — disable HWPDN */
+    rc = rtl_read_reg8(priv, 0x0005, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0005, val & ~0x80);
+
+    /* 0x05[4:3] = 0 — disable WL suspend */
+    rc = rtl_read_reg8(priv, 0x0005, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0005, val & ~0x18);
+
+    /* 0x05[0] = 1 then poll 0x05[0] == 0 — MAC power on */
+    rc = rtl_read_reg8(priv, 0x0005, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0005, val | 0x01);
+    for (i = 0; i < 200; i++) {
+        rc = rtl_read_reg8(priv, 0x0005, &val); if (rc < 0) return -1;
+        if (!(val & 0x01)) break;
+        rtl_sleep_ms(5);
+    }
+    if (val & 0x01) {
+        fprintf(stderr, "  MAC power-on timeout\n");
+        return -1;
+    }
+
+    /* 0x4F[0] = 1 — switch DPDT_SEL_P from WL BB */
+    rc = rtl_read_reg8(priv, 0x004F, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x004F, val | 0x01);
+
+    /* 0x67[5:4] = 3 — switch PAPE_G/PAPE_A and LNAON from WL BB */
+    rc = rtl_read_reg8(priv, 0x0067, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0067, val | 0x30);
+
+    /* 0x25[6] = 0 — anapar_mac, for WLAN single function */
+    rc = rtl_read_reg8(priv, 0x0025, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0025, val & ~0x40);
+
+    /* 0x49[1] = 1 — enable falling edge triggering interrupt */
+    rc = rtl_read_reg8(priv, 0x0049, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0049, val | 0x02);
+
+    /* 0x63[1] = 1 — enable GPIO9 interrupt mode */
+    rc = rtl_read_reg8(priv, 0x0063, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0063, val | 0x02);
+
+    /* 0x62[1] = 0 — enable GPIO9 input mode */
+    rc = rtl_read_reg8(priv, 0x0062, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0062, val & ~0x02);
+
+    /* 0x58[0] = 1 — enable HSISR GPIO interrupt */
+    rc = rtl_read_reg8(priv, 0x0058, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x0058, val | 0x01);
+
+    /* 0x5A[1] = 1 — enable HSISR GPIO9 interrupt */
+    rc = rtl_read_reg8(priv, 0x005A, &val); if (rc < 0) return -1;
+    rtl_write_reg8(priv, 0x005A, val | 0x02);
+
+    /* 0x2E = 0x82 — XTAL trim */
+    rtl_write_reg8(priv, 0x002E, 0x82);
+
+    printf("[RTL8811AU] Power-on complete.\n");
+    return 0;
+}
 
 /*
  * rtl_fw_download — Upload firmware blob to the 8051 co-processor.
@@ -392,6 +503,11 @@ static int rtl_init(radio_t *r)
         return -1;
     }
     printf("  Claimed interface 0\n");
+
+    /* Power-on sequence (MUST run before firmware upload) */
+    if (rtl_power_on(priv) < 0) {
+        fprintf(stderr, "  Warning: Power-on sequence failed\n");
+    }
 
     /* Upload firmware to 8051 co-processor */
     if (rtl_fw_download(priv) < 0) {
