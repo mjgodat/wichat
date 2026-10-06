@@ -151,7 +151,8 @@ static int rtl_read_mac(rtl8811au_priv_t *priv)
 #define REG_MCUFWDL       0x0080   /* MCU firmware download control */
 #define REG_MCUFWDL_PAGE  0x0081   /* Firmware page register (high addr bits) */
 #define REG_8051FW_CTRL   0x0082   /* 8051 CPU reset/start control */
-#define RTL_FW_BLOCK_SIZE 4096     /* Download block size */
+#define RTL_FW_PAGE_SIZE  4096     /* Firmware page size */
+#define RTL_FW_BLOCK_SIZE 196      /* Max bytes per USB control transfer */
 #define RTL_FW_BASE_ADDR  0x1000   /* USB control transfer base address */
 
 #define REG_SYS_FUNC_EN   0x0002   /* System function enable */
@@ -265,6 +266,15 @@ static int rtl_power_on(rtl8811au_priv_t *priv)
     /* 0x2E = 0x82 — XTAL trim */
     rtl_write_reg8(priv, 0x002E, 0x82);
 
+    /* REG_CR (0x0100) = 0x2ff — Enable MAC DMA/WMAC/SCHEDULE/SEC blocks.
+     * Without this, the 8051 has no clocks and cannot execute firmware.
+     * From _InitPowerOn_8812AU in usb_halinit.c */
+    rtl_write_reg16(priv, 0x0100, 0x02FF);
+    printf("  MAC/DMA blocks enabled (REG_CR=0x02FF)\n");
+
+    /* Small delay for clocks to stabilize */
+    rtl_sleep_ms(2);
+
     printf("[RTL8811AU] Power-on complete.\n");
     return 0;
 }
@@ -320,75 +330,139 @@ static int rtl_fw_download(rtl8811au_priv_t *priv)
     }
     printf("  FW: 8051 held in reset\n");
 
-    /* Step 3+4: Download firmware in blocks */
-    for (offset = 0; offset < rtl_firmware_len; offset += RTL_FW_BLOCK_SIZE) {
-        block_len = rtl_firmware_len - offset;
-        if (block_len > RTL_FW_BLOCK_SIZE)
-            block_len = RTL_FW_BLOCK_SIZE;
+    /* Step 3+4: Download firmware page-by-page.
+     *
+     * The chip maps a 4KB window at address 0x1000. The page register
+     * (bits [2:0] of reg 0x0082) selects WHICH 4KB of chip memory is
+     * visible at that window. So we:
+     *   - Set page register to page N
+     *   - Write data to addresses 0x1000..0x1FFF (always same range)
+     *   - Repeat for each page
+     *
+     * Each USB control transfer is limited to RTL_FW_BLOCK_SIZE (196) bytes.
+     */
+    {
+        size_t total_pages = (rtl_firmware_len + RTL_FW_PAGE_SIZE - 1) / RTL_FW_PAGE_SIZE;
+        size_t page_num;
 
-        /* If address exceeds 16 bits, update the page register (0x0081) */
-        uint16_t dl_addr = (uint16_t)((RTL_FW_BASE_ADDR + offset) & 0xFFFF);
-        uint8_t page = (uint8_t)(((RTL_FW_BASE_ADDR + offset) >> 16) & 0xFF);
-        if (page != 0) {
-            rc = rtl_write_reg8(priv, REG_MCUFWDL_PAGE, page);
-            if (rc < 0) {
-                fprintf(stderr, "  FW: failed to set page register at offset %u\n",
-                        (unsigned)offset);
-                return -1;
+        for (page_num = 0; page_num < total_pages; page_num++) {
+            /* Set page register: bits [2:0] of REG_8051FW_CTRL (0x0082) */
+            rc = rtl_read_reg8(priv, REG_8051FW_CTRL, &reg_val);
+            if (rc < 0) return -1;
+            reg_val = (reg_val & 0xF8) | (uint8_t)(page_num & 0x07);
+            rtl_write_reg8(priv, REG_8051FW_CTRL, reg_val);
+
+            /* Calculate how much data is in this page */
+            size_t page_offset = page_num * RTL_FW_PAGE_SIZE;
+            size_t page_remain = rtl_firmware_len - page_offset;
+            if (page_remain > RTL_FW_PAGE_SIZE)
+                page_remain = RTL_FW_PAGE_SIZE;
+
+            /* Write this page in small chunks to address 0x1000+ */
+            size_t written = 0;
+            while (written < page_remain) {
+                size_t chunk = page_remain - written;
+                if (chunk > RTL_FW_BLOCK_SIZE)
+                    chunk = RTL_FW_BLOCK_SIZE;
+
+                uint16_t dl_addr = (uint16_t)(RTL_FW_BASE_ADDR + written);
+                rc = rtl_write_reg(priv, dl_addr,
+                                   rtl_firmware + page_offset + written,
+                                   (uint16_t)chunk);
+                if (rc < 0) {
+                    fprintf(stderr, "  FW: write failed page %u offset %u\n",
+                            (unsigned)page_num, (unsigned)written);
+                    return -1;
+                }
+                written += chunk;
             }
-        }
 
-        /* Write the block via control transfer */
-        rc = rtl_write_reg(priv, dl_addr,
-                           rtl_firmware + offset, (uint16_t)block_len);
-        if (rc < 0) {
-            fprintf(stderr, "  FW: block write failed at offset %u\n",
-                    (unsigned)offset);
-            return -1;
+            printf("  FW: page %u/%u (%u bytes)\n",
+                   (unsigned)(page_num + 1), (unsigned)total_pages,
+                   (unsigned)page_remain);
         }
-
-        printf("  FW: block %u/%u (%u bytes)\n",
-               (unsigned)(offset / RTL_FW_BLOCK_SIZE + 1),
-               (unsigned)((rtl_firmware_len + RTL_FW_BLOCK_SIZE - 1) / RTL_FW_BLOCK_SIZE),
-               (unsigned)block_len);
     }
-
-    /* Reset page register if we changed it */
-    rtl_write_reg8(priv, REG_MCUFWDL_PAGE, 0);
 
     /* Step 5: Clear MCUFWDL enable — clear bit 0 of reg 0x0080 */
     rc = rtl_read_reg8(priv, REG_MCUFWDL, &reg_val);
     if (rc < 0) return -1;
     reg_val &= ~0x01;
-    rc = rtl_write_reg8(priv, REG_MCUFWDL, reg_val);
-    if (rc < 0) {
-        fprintf(stderr, "  FW: failed to clear MCUFWDL\n");
-        return -1;
-    }
+    rtl_write_reg8(priv, REG_MCUFWDL, reg_val);
 
-    /* Step 6: Start 8051 — set bit 3 of reg 0x0082 */
-    rc = rtl_read_reg8(priv, REG_8051FW_CTRL, &reg_val);
-    if (rc < 0) return -1;
-    reg_val |= 0x08;  /* Set bit 3 = release 8051 from reset */
-    rc = rtl_write_reg8(priv, REG_8051FW_CTRL, reg_val);
-    if (rc < 0) {
-        fprintf(stderr, "  FW: failed to start 8051\n");
-        return -1;
-    }
-    printf("  FW: 8051 started, polling for ready...\n");
-
-    /* Step 7: Poll WINTINI_RDY (bit 7 of reg 0x0080) */
-    for (i = 0; i < 100; i++) {
-        rtl_sleep_ms(10);
-        rc = rtl_read_reg8(priv, REG_MCUFWDL, &reg_val);
+    /* Step 6: Poll checksum report — bit 2 of reg 0x0080 (FWDL_ChkSum_rpt) */
+    printf("  FW: polling checksum...\n");
+    for (i = 0; i < 200; i++) {
+        uint32_t val32;
+        rc = rtl_read_reg32(priv, REG_MCUFWDL, &val32);
         if (rc < 0) return -1;
-        if (reg_val & 0x80) {  /* WINTINI_RDY = bit 7 */
-            printf("  FW: firmware ready (poll %d)\n", i + 1);
+        if (val32 & 0x04) {  /* FWDL_ChkSum_rpt = bit 2 */
+            printf("  FW: checksum OK (poll %d, reg=0x%08x)\n", i + 1, val32);
+            break;
+        }
+        rtl_sleep_ms(5);
+    }
+    if (i >= 200) {
+        fprintf(stderr, "  FW: checksum report timeout\n");
+        /* Continue anyway — some chips don't report checksum */
+    }
+
+    /* Step 7: Set MCUFWDL_RDY (bit 1), clear WINTINI_RDY (bit 6) */
+    {
+        uint32_t val32;
+        rc = rtl_read_reg32(priv, REG_MCUFWDL, &val32);
+        if (rc < 0) return -1;
+        val32 |= 0x02;    /* MCUFWDL_RDY = bit 1 */
+        val32 &= ~0x40;   /* WINTINI_RDY = bit 6, clear it */
+        rtl_write_reg32(priv, REG_MCUFWDL, val32);
+        printf("  FW: MCUFWDL_RDY set, WINTINI_RDY cleared\n");
+    }
+
+    /* Step 8: 8051 Reset (RTL8821 variant from _8051Reset8812)
+     * REG_RSV_CTRL = 0x001C, REG_SYS_FUNC_EN = 0x0002 */
+    printf("  FW: resetting 8051...\n");
+    {
+        /* Disable MCU IO wrapper */
+        rc = rtl_read_reg8(priv, 0x001C, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x001C, reg_val & ~0x02);  /* RSV_CTRL bit 1 clear */
+
+        rc = rtl_read_reg8(priv, 0x001D, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x001D, reg_val & ~0x01);  /* RSV_CTRL+1 bit 0 clear (8821) */
+
+        /* Disable FW clock */
+        rc = rtl_read_reg8(priv, 0x0003, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x0003, reg_val & ~0x04);  /* SYS_FUNC_EN+1 bit 2 clear */
+
+        /* Enable MCU IO wrapper */
+        rc = rtl_read_reg8(priv, 0x001C, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x001C, reg_val & ~0x02);  /* RSV_CTRL bit 1 clear */
+
+        rc = rtl_read_reg8(priv, 0x001D, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x001D, reg_val | 0x01);   /* RSV_CTRL+1 bit 0 set (8821) */
+
+        /* Re-enable FW clock */
+        rc = rtl_read_reg8(priv, 0x0003, &reg_val); if (rc < 0) return -1;
+        rtl_write_reg8(priv, 0x0003, reg_val | 0x04);   /* SYS_FUNC_EN+1 bit 2 set */
+    }
+    printf("  FW: 8051 reset complete, polling WINTINI_RDY...\n");
+
+    /* Step 9: Poll WINTINI_RDY (bit 6 of 32-bit reg 0x0080) */
+    for (i = 0; i < 200; i++) {
+        uint32_t val32;
+        rc = rtl_read_reg32(priv, REG_MCUFWDL, &val32);
+        if (rc < 0) return -1;
+        if (val32 & 0x40) {  /* WINTINI_RDY = bit 6 */
+            printf("  FW: firmware READY! (poll %d, reg=0x%08x)\n", i + 1, val32);
             return 0;
         }
+        rtl_sleep_ms(10);
     }
 
-    fprintf(stderr, "  FW: timeout waiting for WINTINI_RDY after 1000ms\n");
+    /* Print final register value for debugging */
+    {
+        uint32_t val32;
+        rtl_read_reg32(priv, REG_MCUFWDL, &val32);
+        fprintf(stderr, "  FW: WINTINI_RDY timeout (reg=0x%08x)\n", val32);
+    }
     return -1;
 }
 
@@ -504,23 +578,58 @@ static int rtl_init(radio_t *r)
     }
     printf("  Claimed interface 0\n");
 
-    /* Power-on sequence (MUST run before firmware upload) */
-    if (rtl_power_on(priv) < 0) {
-        fprintf(stderr, "  Warning: Power-on sequence failed\n");
+    /* Strategy: the Realtek Windows driver already initialized this chip
+     * (firmware, DMA, TX queues, etc.) before Zadig rebind. Don't overwrite
+     * that working state. Just read current config and set monitor mode. */
+    {
+        uint32_t mcufwdl, reg_cr;
+        rtl_read_reg32(priv, REG_MCUFWDL, &mcufwdl);
+        rtl_read_reg32(priv, 0x0100, &reg_cr);
+        printf("  Chip state: MCUFWDL=0x%08x REG_CR=0x%08x\n", mcufwdl, reg_cr);
+
+        if (mcufwdl & 0x02)
+            printf("  Firmware: LOADED (preserving Realtek driver state)\n");
+        else {
+            printf("  Firmware: NOT loaded — running power-on + upload\n");
+            if (rtl_power_on(priv) < 0)
+                fprintf(stderr, "  Warning: Power-on failed\n");
+            if (rtl_fw_download(priv) < 0)
+                fprintf(stderr, "  Warning: Firmware upload failed\n");
+        }
     }
 
-    /* Upload firmware to 8051 co-processor */
-    if (rtl_fw_download(priv) < 0) {
-        fprintf(stderr, "  Warning: Firmware upload failed (may already be loaded)\n");
-        /* Not fatal — device may have firmware in flash or loaded by OS driver */
-    }
+    /* Set monitor mode — accept all frames */
+    rtl_set_monitor_mode(priv);
 
-    /* Set default channel and enable monitor mode */
-    if (rtl_set_channel_regs(priv, 1) < 0) {
-        fprintf(stderr, "  Warning: Default channel set failed\n");
-    }
-    if (rtl_set_monitor_mode(priv) < 0) {
-        fprintf(stderr, "  Warning: Monitor mode setup failed\n");
+    /* Try a raw bulk IN read to see if we receive anything */
+    printf("  Testing RX (5 second listen)...\n");
+    {
+        uint8_t rx_test[2048];
+        int actual = 0;
+        int total_rx = 0;
+        int i, rc2;
+        for (i = 0; i < 50; i++) {  /* 50 x 100ms = 5 seconds */
+            actual = 0;
+            rc2 = libusb_bulk_transfer(priv->dev, RTL_EP_BULK_IN,
+                rx_test, (int)sizeof(rx_test), &actual, 100);
+            if (rc2 == LIBUSB_ERROR_TIMEOUT) continue;
+            if (rc2 != 0) {
+                if (total_rx == 0)
+                    printf("  RX error: %s\n", libusb_error_name(rc2));
+                break;
+            }
+            if (actual > 0) {
+                total_rx++;
+                if (total_rx <= 3) {
+                    int j;
+                    printf("  RX[%d]: %d bytes. Hex: ", total_rx, actual);
+                    for (j = 0; j < 32 && j < actual; j++)
+                        printf("%02x ", rx_test[j]);
+                    printf("\n");
+                }
+            }
+        }
+        printf("  RX test done: %d frames in 5 seconds\n", total_rx);
     }
 
     /* Read MAC address */
@@ -563,38 +672,103 @@ static int rtl_set_tx_power(radio_t *r, uint8_t dbm)
     return 0;
 }
 
+/*
+ * Build a 40-byte RTL8812A/8821A TX descriptor.
+ * The descriptor tells the DMA engine the packet length, TX rate,
+ * queue selection, and other parameters.
+ *
+ * Format (little-endian 32-bit words):
+ *   DWORD 0: pktlen[15:0], offset[23:16], bmc[24], fs[27], ls[26], own[31]
+ *   DWORD 1: macid[5:0], qsel[12:8]
+ *   DWORD 2-3: various flags
+ *   DWORD 4: userate[8], datarate[6:0]
+ *   DWORD 5-9: unused for our purposes
+ */
+#define RTL_TXDESC_SIZE 40
+
+static void rtl_build_txdesc(uint8_t *desc, size_t pkt_len)
+{
+    memset(desc, 0, RTL_TXDESC_SIZE);
+
+    /* DWORD 0: pktlen + offset + flags */
+    uint32_t dw0 = 0;
+    dw0 |= (pkt_len & 0xFFFF);         /* pktlen [15:0] */
+    dw0 |= (RTL_TXDESC_SIZE << 16);    /* offset [23:16] = 40 */
+    dw0 |= (1 << 24);                  /* bmc = 1 (broadcast) */
+    dw0 |= (1 << 26);                  /* ls = 1 (last segment) */
+    dw0 |= (1 << 27);                  /* fs = 1 (first segment) */
+    desc[0] = (uint8_t)(dw0);
+    desc[1] = (uint8_t)(dw0 >> 8);
+    desc[2] = (uint8_t)(dw0 >> 16);
+    desc[3] = (uint8_t)(dw0 >> 24);
+
+    /* DWORD 1: macid=0, qsel=0x12 (beacon/high queue) */
+    uint32_t dw1 = 0;
+    dw1 |= (0x12 << 8);                /* qsel [12:8] = 0x12 */
+    desc[4] = (uint8_t)(dw1);
+    desc[5] = (uint8_t)(dw1 >> 8);
+    desc[6] = (uint8_t)(dw1 >> 16);
+    desc[7] = (uint8_t)(dw1 >> 24);
+
+    /* DWORD 4: userate=1, datarate=0 (1Mbps CCK) */
+    uint32_t dw4 = 0;
+    dw4 |= (1 << 8);                   /* userate = 1 (fixed rate) */
+    dw4 |= 0;                          /* datarate = 0 (1M CCK) */
+    desc[16] = (uint8_t)(dw4);
+    desc[17] = (uint8_t)(dw4 >> 8);
+    desc[18] = (uint8_t)(dw4 >> 16);
+    desc[19] = (uint8_t)(dw4 >> 24);
+}
+
 static int rtl_tx_frame(radio_t *r, const uint8_t *data, size_t len)
 {
     rtl8811au_priv_t *priv = (rtl8811au_priv_t *)r->priv;
     int actual = 0;
+    uint8_t tx_buf[RTL_TXDESC_SIZE + 512];
 
     if (!priv->dev) return -1;
+    if (len + RTL_TXDESC_SIZE > sizeof(tx_buf)) return -1;
+
+    /* Prepend TX descriptor */
+    rtl_build_txdesc(tx_buf, len);
+    memcpy(tx_buf + RTL_TXDESC_SIZE, data, len);
 
     int rc = libusb_bulk_transfer(priv->dev, RTL_EP_BULK_OUT,
-        (unsigned char *)data, (int)len, &actual, RTL_USB_TIMEOUT);
+        tx_buf, (int)(RTL_TXDESC_SIZE + len), &actual, RTL_USB_TIMEOUT);
     if (rc != 0) {
-        fprintf(stderr, "rtl_tx_frame: %s\n", libusb_error_name(rc));
+        static int tx_err_count = 0;
+        if (tx_err_count < 3) {
+            fprintf(stderr, "rtl_tx_frame: %s\n", libusb_error_name(rc));
+            tx_err_count++;
+        }
         return -1;
     }
-    return actual;
+    return (int)len;
 }
+
+/*
+ * RTL8812A/8821A RX descriptor is 24 bytes prepended to each received frame.
+ * DWORD 0[13:0] = pktlen (frame length excluding RX desc)
+ * DWORD 5[7:0] = RSSI (for signal strength)
+ */
+#define RTL_RXDESC_SIZE 24
 
 static int rtl_rx_frame(radio_t *r, uint8_t *buf, size_t max_len, int timeout_ms)
 {
     rtl8811au_priv_t *priv = (rtl8811au_priv_t *)r->priv;
     int actual = 0;
+    uint8_t rx_buf[RTL_RXDESC_SIZE + 2048];
 
     if (!priv->dev) return -1;
 
     int rc = libusb_bulk_transfer(priv->dev, RTL_EP_BULK_IN,
-        buf, (int)max_len, &actual,
+        rx_buf, (int)sizeof(rx_buf), &actual,
         (unsigned int)(timeout_ms > 0 ? timeout_ms : RTL_USB_TIMEOUT));
 
     if (rc == LIBUSB_ERROR_TIMEOUT) {
         return 0;  /* timeout — no data */
     }
     if (rc != 0) {
-        /* Only log non-timeout errors once to avoid spam */
         static int rx_err_count = 0;
         if (rx_err_count < 3) {
             fprintf(stderr, "rtl_rx_frame: %s\n", libusb_error_name(rc));
@@ -604,7 +778,23 @@ static int rtl_rx_frame(radio_t *r, uint8_t *buf, size_t max_len, int timeout_ms
         }
         return -1;
     }
-    return actual;
+
+    /* Need at least the RX descriptor */
+    if (actual <= RTL_RXDESC_SIZE)
+        return 0;
+
+    /* Extract packet length from RX descriptor DWORD 0[13:0] */
+    uint16_t pktlen = (uint16_t)(rx_buf[0] | (rx_buf[1] << 8)) & 0x3FFF;
+    if (pktlen == 0 || pktlen > (uint16_t)(actual - RTL_RXDESC_SIZE))
+        return 0;
+
+    /* Copy frame data (after RX descriptor) to caller's buffer */
+    size_t copy_len = pktlen;
+    if (copy_len > max_len)
+        copy_len = max_len;
+    memcpy(buf, rx_buf + RTL_RXDESC_SIZE, copy_len);
+
+    return (int)copy_len;
 }
 
 static void rtl_shutdown(radio_t *r)
