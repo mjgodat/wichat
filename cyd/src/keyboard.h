@@ -14,7 +14,8 @@ typedef enum {
     KB_CHAR,
     KB_BACKSPACE,
     KB_ENTER,
-    KB_SHIFT
+    KB_SHIFT,
+    KB_FUNC
 } kb_event_type_t;
 
 /* Keyboard event */

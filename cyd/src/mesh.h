@@ -20,11 +20,19 @@ typedef struct {
     uint8_t  active;
 } cyd_mesh_node_t;
 
+/* Delivery status */
+#define MSG_STATUS_NONE     0  /* received from others, no ACK needed */
+#define MSG_STATUS_PENDING  1  /* sent by us, waiting for ACK */
+#define MSG_STATUS_ACKED    2  /* sent by us, ACK received */
+#define MSG_STATUS_FAILED   3  /* sent by us, ACK timeout */
+
 /* ---- Message storage for display ---- */
 typedef struct {
     char     sender[WICHAT_MAX_NAME_LEN];
     char     text[WICHAT_MAX_PAYLOAD + 1];
     uint32_t timestamp_ms;
+    uint32_t msg_id;       /* original msg_id for ACK matching */
+    uint8_t  status;       /* MSG_STATUS_* */
 } cyd_mesh_message_t;
 
 /* ---- Mesh state ---- */

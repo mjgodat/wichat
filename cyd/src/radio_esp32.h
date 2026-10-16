@@ -24,6 +24,9 @@ void radio_esp32_get_mac(uint8_t mac[6]);
  * Returns 0 on success, -1 on error. */
 int radio_esp32_tx(const uint8_t *data, size_t len);
 
+/* Print RX stats to Serial for debugging */
+void radio_esp32_print_stats(void);
+
 /* Non-blocking receive. Copies up to max_len bytes into buf.
  * Writes RSSI to *rssi if non-NULL.
  * Returns number of bytes received, or 0 if queue is empty. */

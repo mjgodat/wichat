@@ -1,8 +1,16 @@
 /* mesh.c — WiChat mesh engine implementation */
 #include "mesh.h"
+#include "wspr.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+
+/* FEC context for reassembly */
+static wspr_ctx_t fec_ctx;
+static int fec_initialized = 0;
+
+/* Number of times to repeat each FEC chunk for redundancy */
+#define FEC_REPETITIONS 3
 
 /* ---- Static helpers ---- */
 
@@ -90,6 +98,41 @@ static int mesh_transmit(mesh_t *m, const wichat_frame_t *frame)
     return m->radio->tx_frame(m->radio, buf, (size_t)n);
 }
 
+#define ACK_DELAY_MS    200
+#define ACK_REPETITIONS 3
+
+/* Send an ACK frame (repeated for reliability) */
+static void send_ack(mesh_t *m, uint32_t orig_msg_id, const uint8_t *dest_mac)
+{
+    int rep;
+    for (rep = 0; rep < ACK_REPETITIONS; rep++) {
+        wichat_frame_t ack;
+        memset(&ack, 0, sizeof(ack));
+        ack.hdr.magic  = WICHAT_MAGIC;
+        ack.hdr.msg_id = frame_gen_msg_id();
+        ack.hdr.ttl    = m->ttl;
+        ack.hdr.type   = WICHAT_TYPE_ACK;
+        memcpy(ack.hdr.sender, m->local_mac, 6);
+        ack.payload[0] = (uint8_t)(orig_msg_id);
+        ack.payload[1] = (uint8_t)(orig_msg_id >> 8);
+        ack.payload[2] = (uint8_t)(orig_msg_id >> 16);
+        ack.payload[3] = (uint8_t)(orig_msg_id >> 24);
+        memcpy(ack.payload + 4, dest_mac, 6);
+        ack.payload_len = 10;
+        mesh_mark_seen(m, ack.hdr.msg_id);
+        mesh_transmit(m, &ack);
+    }
+}
+
+/* Queue a delayed ACK — actual send happens in mesh_tick */
+static void queue_ack(mesh_t *m, uint32_t msg_id, const uint8_t *dest_mac)
+{
+    m->has_pending_ack = 1;
+    m->pending_ack_msg_id = msg_id;
+    memcpy(m->pending_ack_dest, dest_mac, 6);
+    m->pending_ack_at_ms = 0;  /* set in mesh_tick */
+}
+
 /* ---- Public API ---- */
 
 void mesh_init(mesh_t *m, radio_t *radio, const char *callsign)
@@ -98,6 +141,10 @@ void mesh_init(mesh_t *m, radio_t *radio, const char *callsign)
     m->radio   = radio;
     m->channel = WICHAT_DEFAULT_CH;
     m->ttl     = WICHAT_DEFAULT_TTL;
+
+    /* Initialize FEC reassembly */
+    wspr_init(&fec_ctx, 1);
+    fec_initialized = 1;
 
     if (callsign) {
         strncpy(m->callsign, callsign, WICHAT_MAX_NAME_LEN - 1);
@@ -184,6 +231,9 @@ int mesh_process_rx(mesh_t *m, const uint8_t *raw, size_t len, int8_t rssi)
             memcpy(text_buf, frame.payload, copy_len);
         }
         add_message(m, sender_name, text_buf);
+
+        /* Queue ACK (delayed to avoid collision with sender's FEC burst) */
+        queue_ack(m, frame.hdr.msg_id, frame.hdr.sender);
         break;
     }
 
@@ -237,6 +287,42 @@ int mesh_process_rx(mesh_t *m, const uint8_t *raw, size_t len, int8_t rssi)
         break;
     }
 
+    case WICHAT_TYPE_FEC_CHUNK: {
+        /* FEC chunk — feed to reassembly engine */
+        if (!fec_initialized) {
+            wspr_init(&fec_ctx, 1);
+            fec_initialized = 1;
+        }
+        int fec_rc = wspr_feed_chunk(&fec_ctx, &frame);
+        if (fec_rc == 1) {
+            /* Message complete — extract and display */
+            /* Get parent_msg_id from chunk payload */
+            uint32_t parent_id = 0;
+            if (frame.payload_len >= 4) {
+                parent_id = (uint32_t)frame.payload[0]
+                          | ((uint32_t)frame.payload[1] << 8)
+                          | ((uint32_t)frame.payload[2] << 16)
+                          | ((uint32_t)frame.payload[3] << 24);
+            }
+            /* Only display if we haven't already seen the plain chat */
+            if (!mesh_is_seen(m, parent_id)) {
+                mesh_mark_seen(m, parent_id);
+                uint8_t msg_buf[WICHAT_MAX_PAYLOAD + 1];
+                memset(msg_buf, 0, sizeof(msg_buf));
+                int msg_len = wspr_get_message(&fec_ctx, parent_id,
+                                                msg_buf, WICHAT_MAX_PAYLOAD);
+                if (msg_len > 0) {
+                    const char *sender_name = resolve_sender(m, frame.hdr.sender);
+                    add_message(m, sender_name, (const char *)msg_buf);
+
+                    /* Queue ACK for FEC-reassembled message */
+                    queue_ack(m, parent_id, frame.hdr.sender);
+                }
+            }
+        }
+        break;
+    }
+
     default:
         break;
     }
@@ -267,7 +353,7 @@ int mesh_send_chat(mesh_t *m, const char *text)
     frame.hdr.type   = WICHAT_TYPE_CHAT;
     memcpy(frame.hdr.sender, m->local_mac, 6);
 
-    text_len = strlen(text);
+    text_len = strlen(text) + 1;  /* include null terminator */
     if (text_len > WICHAT_MAX_PAYLOAD)
         text_len = WICHAT_MAX_PAYLOAD;
 
@@ -280,8 +366,30 @@ int mesh_send_chat(mesh_t *m, const char *text)
     /* Mark seen so we don't process our own relayed copies */
     mesh_mark_seen(m, frame.hdr.msg_id);
 
-    /* Transmit */
+    /* Transmit the plain chat frame */
     mesh_transmit(m, &frame);
+
+    /* Also send FEC chunks (3x repetition for range extension).
+     * Each chunk carries the full message with a parent_msg_id link.
+     * If the plain frame is lost, the FEC chunks provide redundancy. */
+    {
+        wspr_tx_t fec_tx;
+        int nchunks = wspr_encode(&fec_tx, (const uint8_t *)text, text_len,
+                                   frame.hdr.msg_id);
+        if (nchunks > 0) {
+            int rep, ci;
+            for (rep = 0; rep < FEC_REPETITIONS; rep++) {
+                for (ci = 0; ci < nchunks; ci++) {
+                    wichat_frame_t chunk_frame;
+                    if (wspr_build_chunk_frame(&fec_tx, ci, m->local_mac,
+                                               &chunk_frame) == 0) {
+                        mesh_mark_seen(m, chunk_frame.hdr.msg_id);
+                        mesh_transmit(m, &chunk_frame);
+                    }
+                }
+            }
+        }
+    }
 
     return 0;
 }
@@ -340,6 +448,16 @@ int mesh_send_ping(mesh_t *m)
 void mesh_tick(mesh_t *m, uint32_t now_ms)
 {
     static uint32_t last_expire_ms = 0;
+
+    /* Send delayed ACK if ready */
+    if (m->has_pending_ack) {
+        if (m->pending_ack_at_ms == 0) {
+            m->pending_ack_at_ms = now_ms + ACK_DELAY_MS;
+        } else if (now_ms >= m->pending_ack_at_ms) {
+            send_ack(m, m->pending_ack_msg_id, m->pending_ack_dest);
+            m->has_pending_ack = 0;
+        }
+    }
 
     /* Send beacon if interval elapsed */
     if (now_ms - m->last_beacon_ms >= WICHAT_BEACON_INTERVAL_MS) {

@@ -1,0 +1,497 @@
+/* display.cpp -- ST77922 QSPI display for Freenove ESP32-S3 3.5"
+ * Uses IDF SPI master in quad mode, based on Freenove's ST77922 driver
+ * and the SquatchWatch-CYD st77922_qspi implementation. */
+#include "display.h"
+#include "config.h"
+#include <Arduino.h>
+#include <string.h>
+#include <stdarg.h>
+#include <driver/spi_master.h>
+#include <esp_heap_caps.h>
+
+/* Panel constants */
+#define PANEL_W 320
+#define PANEL_H 480
+#define MAX_PIXELS 0x4000
+#define FILL_PX 2048
+
+/* SPI commands */
+#define CMD_1W 0x02
+#define CMD_4W 0x32
+#define RAM_WRITE 0x2C
+#define RAM_CONTINUE 0x3C
+
+/* Colors (RGB565) */
+#define COL_BG         0x0000
+#define COL_STATUS_BG  0x18E3
+#define COL_STATUS_FG  0x07E0
+#define COL_SENDER     0x07FF
+#define COL_TEXT       0xFFFF
+#define COL_INPUT_BG   0x10A2
+#define COL_INPUT_FG   0xFFE0
+#define COL_SYSTEM     0xF800
+#define COL_CURSOR     0xFFFF
+
+/* Layout */
+#define STATUS_H  24
+#define LINE_H    16
+#define INPUT_H   20
+#define CHAT_AREA_Y STATUS_H
+#define CHAT_AREA_H (TFT_HEIGHT - STATUS_H - KB_HEIGHT - INPUT_H)
+#define INPUT_Y     (TFT_HEIGHT - KB_HEIGHT - INPUT_H)
+
+/* ---- QSPI driver state ---- */
+static spi_device_handle_t s_dev = nullptr;
+static bool s_ready = false;
+static bool s_inFlight = false;
+static spi_transaction_ext_t s_tx;
+static uint16_t *s_fill = nullptr;
+
+/* Simple text cursor state */
+static int16_t s_cx = 0, s_cy = 0;
+static uint16_t s_fg = 0xFFFF, s_bg = 0x0000;
+static uint8_t s_textSize = 1;
+
+/* Byte swap for wire order */
+static inline uint16_t wire(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
+
+/* Wait for in-flight DMA transfer */
+static void qspi_wait(void) {
+    if (!s_inFlight) return;
+    spi_transaction_t *done = nullptr;
+    spi_device_get_trans_result(s_dev, &done, portMAX_DELAY);
+    s_inFlight = false;
+}
+
+/* Write a register on one lane */
+static void writeReg(uint8_t reg, const uint8_t *data, size_t len) {
+    if (!s_ready) return;
+    qspi_wait();
+    spi_transaction_ext_t t;
+    memset(&t, 0, sizeof t);
+    t.base.flags   = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR;
+    t.base.cmd     = CMD_1W;
+    t.base.addr    = (uint32_t)reg << 8;
+    t.command_bits = 8;
+    t.address_bits = 24;
+    if (len && data) {
+        uint8_t tmp[16];
+        if (len > sizeof tmp) len = sizeof tmp;
+        memcpy(tmp, data, len);
+        t.base.tx_buffer = tmp;
+        t.base.length    = 8 * len;
+    }
+    spi_device_polling_transmit(s_dev, &t.base);
+}
+
+/* Freenove's ST77922 init sequence */
+static const uint8_t INIT[] = {
+    0xF1, 1, 0, 0x00, 0x60, 3, 0, 0x00, 0x00, 0x00, 0x65, 1, 0, 0x80,
+    0x79, 1, 0, 0x06, 0x7B, 3, 0, 0x00, 0x08, 0x08,
+    0x80, 11, 0, 0x55, 0x62, 0x2F, 0x17, 0xF0, 0x52, 0x70, 0xD2, 0x52, 0x62, 0xEA,
+    0x81, 4, 0, 0x26, 0x52, 0x72, 0x27, 0x84, 2, 0, 0x92, 0x25,
+    0x87, 6, 0, 0x10, 0x10, 0x58, 0x00, 0x02, 0x3A,
+    0x88, 15, 0, 0x00, 0x00, 0x2C, 0x10, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x06,
+    0x89, 3, 0, 0x00, 0x00, 0x00,
+    0x8A, 11, 0, 0x13, 0x00, 0x2C, 0x00, 0x00, 0x2C, 0x10, 0x10, 0x00, 0x3E, 0x19,
+    0x8B, 9, 0, 0x15, 0xB1, 0xB1, 0x44, 0x96, 0x2C, 0x10, 0x97, 0x8E,
+    0x8C, 13, 0, 0x1D, 0xB1, 0xB1, 0x44, 0x96, 0x2C, 0x10, 0x50, 0x0F, 0x01, 0xC5, 0x12, 0x09,
+    0x8D, 1, 0, 0x0C, 0x8E, 6, 0, 0x33, 0x01, 0x0C, 0x13, 0x01, 0x01,
+    0xB3, 2, 0, 0x00, 0x30, 0xF1, 1, 0, 0x00, 0x71, 1, 0, 0xD0,
+    0x66, 2, 0, 0x02, 0x3F, 0xBE, 3, 0, 0x26, 0x00, 0x9D,
+    0x70, 12, 0, 0x01, 0xA0, 0x11, 0x40, 0xE0, 0x00, 0x11, 0x69, 0x11, 0x00, 0x00, 0x1A,
+    0x90, 9, 0, 0x04, 0x04, 0x55, 0x74, 0x00, 0x40, 0x43, 0x27, 0x27,
+    0x91, 9, 0, 0x04, 0x04, 0x55, 0x75, 0x00, 0x40, 0x42, 0x27, 0x27,
+    0x92, 10, 0, 0x04, 0x44, 0x55, 0xC0, 0x06, 0x00, 0x07, 0x05, 0x90, 0x27,
+    0x93, 10, 0, 0x04, 0x43, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0x90, 0x27,
+    0x94, 6, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x95, 5, 0, 0x96, 0x16, 0x00, 0x00, 0xFF,
+    0x96, 12, 0, 0x44, 0x53, 0x03, 0x12, 0x23, 0x24, 0x06, 0x05, 0x94, 0x27, 0x00, 0x44,
+    0x97, 12, 0, 0x44, 0x53, 0x47, 0x56, 0x20, 0x20, 0x02, 0x01, 0x94, 0x27, 0x00, 0x44,
+    0xBA, 5, 0, 0x55, 0x94, 0x2D, 0x94, 0x27,
+    0x9A, 7, 0, 0x40, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
+    0x9B, 7, 0, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00,
+    0x9C, 13, 0, 0x5C, 0x12, 0x00, 0x00, 0x10, 0x12, 0x00, 0x00, 0x10, 0x02, 0x00, 0x00, 0x00,
+    0x9D, 8, 0, 0x8A, 0x51, 0x00, 0x00, 0x00, 0x80, 0x1E, 0x01,
+    0x9E, 7, 0, 0x51, 0x00, 0x00, 0x00, 0x80, 0x1E, 0x01,
+    0xB4, 12, 0, 0x1D, 0x1C, 0x1E, 0x0B, 0x14, 0x02, 0x13, 0x09, 0x1E, 0x00, 0x1E, 0x10,
+    0xB5, 12, 0, 0x1D, 0x1C, 0x1E, 0x0A, 0x15, 0x03, 0x11, 0x08, 0x1E, 0x01, 0x1E, 0x12,
+    0xB6, 7, 0, 0x77, 0x77, 0x00, 0x0A, 0xFF, 0x0A, 0xFF,
+    0x86, 14, 0, 0xCD, 0x04, 0xB1, 0x02, 0x58, 0x12, 0x58, 0x0C, 0x13, 0x01, 0xA5, 0x00, 0xA5, 0xA5,
+    0xB7, 16, 0, 0x07, 0x0A, 0x0E, 0x06, 0x05, 0x03, 0x2B, 0x03, 0x03, 0x42, 0x07, 0x10, 0x10, 0x2E, 0x3F, 0x0D,
+    0xB8, 16, 0, 0x07, 0x0A, 0x0D, 0x05, 0x05, 0x02, 0x2B, 0x02, 0x03, 0x42, 0x06, 0x10, 0x0F, 0x2E, 0x3F, 0x0D,
+    0xB9, 2, 0, 0x23, 0x23,
+    0xBF, 6, 0, 0x10, 0x14, 0x14, 0x0B, 0x0B, 0x0B,
+    0xF2, 1, 0, 0x00,
+    0x73, 5, 0, 0x04, 0xDA, 0x12, 0x54, 0x47,
+    0x77, 5, 0, 0x6B, 0x5B, 0xFD, 0xC3, 0xC5,
+    0x7A, 2, 0, 0x15, 0x27, 0x7B, 2, 0, 0x04, 0x57,
+    0x7E, 2, 0, 0x01, 0x0E, 0xBF, 1, 0, 0x36,
+    0xE3, 2, 0, 0x40, 0x40, 0xF0, 1, 0, 0x00, 0xD0, 1, 0, 0x00,
+    0x2A, 4, 0, 0x00, 0x00, 0x01, 0x3F,
+    0x2B, 4, 0, 0x00, 0x00, 0x01, 0xDF,
+    0x21, 0, 0,
+    0x11, 0, 120,
+    0x29, 0, 0,
+    0x2C, 0, 0,
+    0x3A, 1, 0, 0x01,
+    0x36, 1, 0, 0x00,
+    0x35, 1, 20, 0x01,
+};
+
+/* Set pixel window in PANEL coords (portrait) */
+static void setWindow(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    const uint8_t xs[4] = { (uint8_t)(x0 >> 8), (uint8_t)x0, (uint8_t)(x1 >> 8), (uint8_t)x1 };
+    const uint8_t ys[4] = { (uint8_t)(y0 >> 8), (uint8_t)y0, (uint8_t)(y1 >> 8), (uint8_t)y1 };
+    writeReg(0x2A, xs, 4);
+    writeReg(0x2B, ys, 4);
+}
+
+/* Queue pixels via DMA (quad mode) */
+static bool queuePixels(const uint16_t *dma, size_t count, bool first) {
+    if (!s_ready || !count) return false;
+    if (count > MAX_PIXELS) count = MAX_PIXELS;
+    if (first) writeReg(RAM_WRITE, nullptr, 0);
+    qspi_wait();
+    memset(&s_tx, 0, sizeof s_tx);
+    s_tx.base.flags   = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR;
+    s_tx.base.cmd     = CMD_4W;
+    s_tx.base.addr    = (uint32_t)RAM_CONTINUE << 8;
+    s_tx.command_bits = 8;
+    s_tx.address_bits = 24;
+    s_tx.base.tx_buffer = dma;
+    s_tx.base.length    = count * 16;
+    esp_err_t r = spi_device_queue_trans(s_dev, &s_tx.base, portMAX_DELAY);
+    if (r != ESP_OK) return false;
+    s_inFlight = true;
+    return true;
+}
+
+/* Fill a rectangle in PANEL coords (portrait) */
+static void panel_fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t rgb565) {
+    if (!s_ready || !s_fill || w <= 0 || h <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > PANEL_W) w = PANEL_W - x;
+    if (y + h > PANEL_H) h = PANEL_H - y;
+    if (w <= 0 || h <= 0) return;
+    uint16_t c = wire(rgb565);
+    for (size_t i = 0; i < FILL_PX; i++) s_fill[i] = c;
+    setWindow(x, y, x + w - 1, y + h - 1);
+    size_t left = (size_t)w * (size_t)h;
+    bool first = true;
+    while (left) {
+        size_t n = left < FILL_PX ? left : FILL_PX;
+        queuePixels(s_fill, n, first);
+        first = false;
+        left -= n;
+    }
+    qspi_wait();
+}
+
+/* Landscape to portrait rotation (rotation 1):
+ * panel_x = PANEL_W - y - h
+ * panel_y = x */
+static void toPanel(int16_t x, int16_t y, int16_t w, int16_t h,
+                    int16_t *px, int16_t *py, int16_t *pw, int16_t *ph) {
+    *px = PANEL_W - y - h;
+    *py = x;
+    *pw = h;
+    *ph = w;
+}
+
+/* ---- Public API ---- */
+
+void display_fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
+    int16_t px, py, pw, ph;
+    toPanel(x, y, w, h, &px, &py, &pw, &ph);
+    panel_fillRect(px, py, pw, ph, color);
+}
+
+/* Adafruit 5x7 font — complete ASCII 32..126 (95 chars × 5 bytes = 475 bytes) */
+static const uint8_t font5x7[475] = {
+ 0x00,0x00,0x00,0x00,0x00, /* sp */
+ 0x00,0x00,0x5F,0x00,0x00, /* ! */
+ 0x00,0x07,0x00,0x07,0x00, /* " */
+ 0x14,0x7F,0x14,0x7F,0x14, /* # */
+ 0x24,0x2A,0x7F,0x2A,0x12, /* $ */
+ 0x23,0x13,0x08,0x64,0x62, /* % */
+ 0x36,0x49,0x55,0x22,0x50, /* & */
+ 0x00,0x05,0x03,0x00,0x00, /* ' */
+ 0x00,0x1C,0x22,0x41,0x00, /* ( */
+ 0x00,0x41,0x22,0x1C,0x00, /* ) */
+ 0x08,0x2A,0x1C,0x2A,0x08, /* * */
+ 0x08,0x08,0x3E,0x08,0x08, /* + */
+ 0x00,0x50,0x30,0x00,0x00, /* , */
+ 0x08,0x08,0x08,0x08,0x08, /* - */
+ 0x00,0x60,0x60,0x00,0x00, /* . */
+ 0x20,0x10,0x08,0x04,0x02, /* / */
+ 0x3E,0x51,0x49,0x45,0x3E, /* 0 */
+ 0x00,0x42,0x7F,0x40,0x00, /* 1 */
+ 0x42,0x61,0x51,0x49,0x46, /* 2 */
+ 0x21,0x41,0x45,0x4B,0x31, /* 3 */
+ 0x18,0x14,0x12,0x7F,0x10, /* 4 */
+ 0x27,0x45,0x45,0x45,0x39, /* 5 */
+ 0x3C,0x4A,0x49,0x49,0x30, /* 6 */
+ 0x01,0x71,0x09,0x05,0x03, /* 7 */
+ 0x36,0x49,0x49,0x49,0x36, /* 8 */
+ 0x06,0x49,0x49,0x29,0x1E, /* 9 */
+ 0x00,0x36,0x36,0x00,0x00, /* : */
+ 0x00,0x56,0x36,0x00,0x00, /* ; */
+ 0x00,0x08,0x14,0x22,0x41, /* < */
+ 0x14,0x14,0x14,0x14,0x14, /* = */
+ 0x41,0x22,0x14,0x08,0x00, /* > */
+ 0x02,0x01,0x51,0x09,0x06, /* ? */
+ 0x32,0x49,0x79,0x41,0x3E, /* @ */
+ 0x7E,0x11,0x11,0x11,0x7E, /* A */
+ 0x7F,0x49,0x49,0x49,0x36, /* B */
+ 0x3E,0x41,0x41,0x41,0x22, /* C */
+ 0x7F,0x41,0x41,0x22,0x1C, /* D */
+ 0x7F,0x49,0x49,0x49,0x41, /* E */
+ 0x7F,0x09,0x09,0x01,0x01, /* F */
+ 0x3E,0x41,0x41,0x51,0x32, /* G */
+ 0x7F,0x08,0x08,0x08,0x7F, /* H */
+ 0x00,0x41,0x7F,0x41,0x00, /* I */
+ 0x20,0x40,0x41,0x3F,0x01, /* J */
+ 0x7F,0x08,0x14,0x22,0x41, /* K */
+ 0x7F,0x40,0x40,0x40,0x40, /* L */
+ 0x7F,0x02,0x04,0x02,0x7F, /* M */
+ 0x7F,0x04,0x08,0x10,0x7F, /* N */
+ 0x3E,0x41,0x41,0x41,0x3E, /* O */
+ 0x7F,0x09,0x09,0x09,0x06, /* P */
+ 0x3E,0x41,0x51,0x21,0x5E, /* Q */
+ 0x7F,0x09,0x19,0x29,0x46, /* R */
+ 0x46,0x49,0x49,0x49,0x31, /* S */
+ 0x01,0x01,0x7F,0x01,0x01, /* T */
+ 0x3F,0x40,0x40,0x40,0x3F, /* U */
+ 0x1F,0x20,0x40,0x20,0x1F, /* V */
+ 0x7F,0x20,0x18,0x20,0x7F, /* W */
+ 0x63,0x14,0x08,0x14,0x63, /* X */
+ 0x03,0x04,0x78,0x04,0x03, /* Y */
+ 0x61,0x51,0x49,0x45,0x43, /* Z */
+ 0x00,0x00,0x7F,0x41,0x41, /* [ */
+ 0x02,0x04,0x08,0x10,0x20, /* \ */
+ 0x41,0x41,0x7F,0x00,0x00, /* ] */
+ 0x04,0x02,0x01,0x02,0x04, /* ^ */
+ 0x40,0x40,0x40,0x40,0x40, /* _ */
+ 0x00,0x01,0x02,0x04,0x00, /* ` */
+ 0x20,0x54,0x54,0x54,0x78, /* a */
+ 0x7F,0x48,0x44,0x44,0x38, /* b */
+ 0x38,0x44,0x44,0x44,0x20, /* c */
+ 0x38,0x44,0x44,0x48,0x7F, /* d */
+ 0x38,0x54,0x54,0x54,0x18, /* e */
+ 0x08,0x7E,0x09,0x01,0x02, /* f */
+ 0x08,0x14,0x54,0x54,0x3C, /* g */
+ 0x7F,0x08,0x04,0x04,0x78, /* h */
+ 0x00,0x44,0x7D,0x40,0x00, /* i */
+ 0x20,0x40,0x44,0x3D,0x00, /* j */
+ 0x00,0x7F,0x10,0x28,0x44, /* k */
+ 0x00,0x41,0x7F,0x40,0x00, /* l */
+ 0x7C,0x04,0x18,0x04,0x78, /* m */
+ 0x7C,0x08,0x04,0x04,0x78, /* n */
+ 0x38,0x44,0x44,0x44,0x38, /* o */
+ 0x7C,0x14,0x14,0x14,0x08, /* p */
+ 0x08,0x14,0x14,0x18,0x7C, /* q */
+ 0x7C,0x08,0x04,0x04,0x08, /* r */
+ 0x48,0x54,0x54,0x54,0x20, /* s */
+ 0x04,0x3F,0x44,0x40,0x20, /* t */
+ 0x3C,0x40,0x40,0x20,0x7C, /* u */
+ 0x1C,0x20,0x40,0x20,0x1C, /* v */
+ 0x3C,0x40,0x30,0x40,0x3C, /* w */
+ 0x44,0x28,0x10,0x28,0x44, /* x */
+ 0x0C,0x50,0x50,0x50,0x3C, /* y */
+ 0x44,0x64,0x54,0x4C,0x44, /* z */
+ 0x00,0x08,0x36,0x41,0x00, /* { */
+ 0x00,0x00,0x7F,0x00,0x00, /* | */
+ 0x00,0x41,0x36,0x08,0x00, /* } */
+ 0x08,0x08,0x2A,0x1C,0x08, /* ~ */
+};
+
+/* DMA-safe char buffer */
+static uint16_t *s_charBuf = nullptr;
+
+/* Draw one character as a single QSPI transfer.
+ * Builds landscape buffer, transposes to panel orientation, sends once. */
+static void drawChar(int16_t x, int16_t y, char c, uint16_t fg, uint16_t bg, uint8_t sz) {
+    if (c < 32 || c > 126) c = '?';
+    if (!s_charBuf) return;
+
+    int cw = 6 * sz, ch = 8 * sz;
+    int idx = (c - 32) * 5;
+    uint16_t wfg = wire(fg), wbg = wire(bg);
+
+    /* Build landscape buffer (row-major: row = y offset, col = x offset) */
+    for (int col = 0; col < 6; col++) {
+        uint8_t bits = (col < 5) ? font5x7[idx + col] : 0;
+        for (int row = 0; row < 8; row++) {
+            uint16_t wc = (row < 7 && (bits & (1 << row))) ? wfg : wbg;
+            if (sz == 1) {
+                s_charBuf[row * 6 + col] = wc;
+            } else {
+                for (int sy = 0; sy < sz; sy++)
+                    for (int sx = 0; sx < sz; sx++)
+                        s_charBuf[(row * sz + sy) * cw + col * sz + sx] = wc;
+            }
+        }
+    }
+
+    /* Panel rect for rotation 1 */
+    int16_t px = PANEL_W - y - ch;
+    int16_t py = x;
+    int16_t pw = ch;   /* panel x extent (width in panel coords) */
+    int16_t ph = cw;   /* panel y extent (height in panel coords) */
+
+    /* Transpose: panel memory fills x-fast (dx), y-slow (dy).
+     * dst[dy * pw + dx] = src[(ch-1-dx) * cw + dy] */
+    uint16_t *dst = s_charBuf + cw * ch;
+    for (int dy = 0; dy < ph; dy++) {
+        for (int dx = 0; dx < pw; dx++) {
+            dst[dy * pw + dx] = s_charBuf[(ch - 1 - dx) * cw + dy];
+        }
+    }
+
+    setWindow(px, py, px + pw - 1, py + ph - 1);
+    queuePixels(dst, (size_t)(pw * ph), true);
+    qspi_wait();
+}
+
+void display_setCursor(int16_t x, int16_t y) { s_cx = x; s_cy = y; }
+void display_setTextColor(uint16_t fg, uint16_t bg) { s_fg = fg; s_bg = bg; }
+void display_setTextSize(uint8_t s) { s_textSize = s ? s : 1; }
+
+void display_print(const char *str) {
+    while (*str) {
+        if (*str == '\n') { s_cy += 8 * s_textSize; s_cx = 0; }
+        else {
+            drawChar(s_cx, s_cy, *str, s_fg, s_bg, s_textSize);
+            s_cx += 6 * s_textSize;
+        }
+        str++;
+    }
+}
+
+void display_printf(const char *fmt, ...) {
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    display_print(buf);
+}
+
+/* ---- Init ---- */
+
+void display_init(void) {
+    spi_bus_config_t bus;
+    memset(&bus, 0, sizeof bus);
+    bus.mosi_io_num   = LCD_D0;
+    bus.miso_io_num   = LCD_D1;
+    bus.sclk_io_num   = LCD_SCLK;
+    bus.quadwp_io_num = LCD_D2;
+    bus.quadhd_io_num = LCD_D3;
+    bus.data4_io_num  = -1;
+    bus.data5_io_num  = -1;
+    bus.data6_io_num  = -1;
+    bus.data7_io_num  = -1;
+    bus.max_transfer_sz = (int)(MAX_PIXELS * 2 + 8);
+    bus.flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_IOMUX_PINS | SPICOMMON_BUSFLAG_QUAD;
+
+    esp_err_t r = spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
+    if (r != ESP_OK) { Serial.printf("[display] bus init failed: %d\n", (int)r); return; }
+
+    spi_device_interface_config_t dev;
+    memset(&dev, 0, sizeof dev);
+    dev.mode           = 0;
+    dev.clock_speed_hz = 80000000;
+    dev.spics_io_num   = LCD_CS;
+    dev.flags          = SPI_DEVICE_HALFDUPLEX;
+    dev.queue_size     = 4;
+    r = spi_bus_add_device(SPI2_HOST, &dev, &s_dev);
+    if (r != ESP_OK) { Serial.printf("[display] device add failed: %d\n", (int)r); return; }
+
+    s_fill = (uint16_t *)heap_caps_malloc(FILL_PX * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    /* Char buffer: src + dst for size up to 3 (18×24 × 2) */
+    s_charBuf = (uint16_t *)heap_caps_malloc(2 * 18 * 24 * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_ready = true;
+
+    /* Run init sequence */
+    for (size_t i = 0; i < sizeof INIT;) {
+        uint8_t reg = INIT[i], n = INIT[i + 1], ms = INIT[i + 2];
+        writeReg(reg, INIT + i + 3, n);
+        if (ms) delay(ms);
+        i += 3 + n;
+    }
+
+    /* Backlight on */
+    pinMode(LCD_BL, OUTPUT);
+    digitalWrite(LCD_BL, HIGH);
+
+    /* Clear to black */
+    panel_fillRect(0, 0, PANEL_W, PANEL_H, 0x0000);
+
+    Serial.println("[display] ST77922 QSPI up, 320x480, backlight on");
+}
+
+void display_clear(void) {
+    panel_fillRect(0, 0, PANEL_W, PANEL_H, COL_BG);
+}
+
+void display_flush(void) {
+    /* No framebuffer — drawing is immediate */
+}
+
+void display_status_bar(const char *callsign, uint8_t channel,
+                        int node_count, uint32_t uptime_ms) {
+    display_fillRect(0, 0, TFT_WIDTH, STATUS_H, COL_STATUS_BG);
+    display_setTextColor(COL_STATUS_FG, COL_STATUS_BG);
+    display_setTextSize(2);
+    display_setCursor(4, 4);
+    display_printf("%.12s", callsign);
+
+    char ch_buf[16];
+    snprintf(ch_buf, sizeof ch_buf, "CH:%d", channel);
+    display_setCursor(TFT_WIDTH / 2 - (int)strlen(ch_buf) * 6, 4);
+    display_print(ch_buf);
+
+    char right_buf[32];
+    uint32_t up_sec = uptime_ms / 1000;
+    snprintf(right_buf, sizeof right_buf, "N:%d %lu:%02lu",
+             node_count, (unsigned long)(up_sec / 60), (unsigned long)(up_sec % 60));
+    display_setCursor(TFT_WIDTH - (int)strlen(right_buf) * 12 - 4, 4);
+    display_print(right_buf);
+}
+
+void display_message(int line, const char *sender, const char *text, uint8_t status) {
+    if (line < 0 || line >= CHAT_LINES) return;
+    int y = CHAT_AREA_Y + line * LINE_H;
+    display_fillRect(0, y, TFT_WIDTH, LINE_H, COL_BG);
+
+    if (status == 1) { display_setTextColor(0xFFE0, COL_BG); display_setCursor(TFT_WIDTH - 8, y + 2); display_print("?"); }
+    else if (status == 2) { display_setTextColor(0x07E0, COL_BG); display_setCursor(TFT_WIDTH - 8, y + 2); display_print("Y"); }
+    else if (status == 3) { display_setTextColor(0xF800, COL_BG); display_setCursor(TFT_WIDTH - 8, y + 2); display_print("X"); }
+
+    bool is_system = (sender[0] == '[');
+    display_setTextColor(is_system ? COL_SYSTEM : COL_SENDER, COL_BG);
+    display_setTextSize(1);
+    display_setCursor(2, y + 2);
+    display_printf("%.10s: ", sender);
+    display_setTextColor(COL_TEXT, COL_BG);
+    display_printf("%.58s", text);
+}
+
+void display_clear_chat(void) {
+    display_fillRect(0, CHAT_AREA_Y, TFT_WIDTH, CHAT_AREA_H, COL_BG);
+}
+
+void display_input(const char *text, int cursor_pos) {
+    int y = INPUT_Y;
+    display_fillRect(0, y, TFT_WIDTH, INPUT_H, COL_INPUT_BG);
+    display_setTextColor(COL_INPUT_FG, COL_INPUT_BG);
+    display_setTextSize(2);
+    display_setCursor(4, y + 2);
+    display_print("> ");
+    if (text && text[0] != '\0') display_printf("%.36s", text);
+    int cx = 4 + 24 + cursor_pos * 12;
+    if (cx < TFT_WIDTH - 6)
+        display_fillRect(cx, y + 2, 2, INPUT_H - 4, COL_CURSOR);
+}

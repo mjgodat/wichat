@@ -12,6 +12,7 @@
 #include "frame.h"
 #include "radio.h"
 #include "radio_rtl8811au.h"
+#include "radio_serial_bridge.h"
 #include "mesh.h"
 #include "gui.h"
 
@@ -29,6 +30,9 @@ static uint32_t get_ms(void)
 int main(int argc, char **argv)
 {
     const char *callsign = WICHAT_DEFAULT_NAME;
+    const char *serial_port = NULL;
+    int force_bridge = 0;
+    int is_bridge = 0;  /* set to 1 if we ended up using the bridge backend */
     radio_t radio;
     mesh_t mesh;
     gui_ctx_t gui;
@@ -37,33 +41,83 @@ int main(int argc, char **argv)
 
     printf("WiChat v%s\n", WICHAT_VERSION);
 
-    /* Parse --name argument */
+    /* Parse arguments */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
             callsign = argv[++i];
+        } else if (strcmp(argv[i], "--bridge") == 0) {
+            force_bridge = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                serial_port = argv[++i]; /* e.g. --bridge COM5 */
+            }
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            serial_port = argv[++i];
+            force_bridge = 1;
         }
     }
 
-    /* ---- Create radio (fall back to offline mode) ---- */
+    /* ---- Create radio (try bridge, then RTL, then offline) ---- */
     memset(&radio, 0, sizeof(radio));
-    if (rtl8811au_create(&radio) == 0) {
-        if (radio.init(&radio) == 0) {
-            radio_online = 1;
-            printf("Radio online.\n");
+
+    if (force_bridge) {
+        /* User explicitly requested bridge mode */
+        printf("Bridge mode: connecting to ESP32 via serial...\n");
+        if (serial_bridge_create(&radio, serial_port) == 0) {
+            if (radio.init(&radio) == 0) {
+                radio_online = 1;
+                is_bridge = 1;
+                printf("Radio online (ESP32 serial bridge).\n");
+            } else {
+                printf("Bridge radio init failed -- offline mode.\n");
+            }
         } else {
-            printf("Radio init failed -- offline mode.\n");
+            printf("Bridge create failed -- offline mode.\n");
         }
     } else {
-        printf("Radio create failed -- offline mode.\n");
+        /* Try RTL8811AU first, fall back to bridge auto-detect */
+        if (rtl8811au_create(&radio) == 0) {
+            if (radio.init(&radio) == 0) {
+                radio_online = 1;
+                is_bridge = 0;
+                printf("Radio online (RTL8811AU).\n");
+            } else {
+                printf("RTL8811AU init failed, trying serial bridge...\n");
+            }
+        } else {
+            printf("RTL8811AU not found, trying serial bridge...\n");
+        }
+
+        /* If RTL failed, try auto-detecting a serial bridge */
+        if (!radio_online) {
+            memset(&radio, 0, sizeof(radio));
+            if (serial_bridge_create(&radio, NULL) == 0) {
+                if (radio.init(&radio) == 0) {
+                    radio_online = 1;
+                    is_bridge = 1;
+                    printf("Radio online (ESP32 serial bridge, auto-detected).\n");
+                } else {
+                    printf("Bridge radio init failed -- offline mode.\n");
+                }
+            } else {
+                printf("No radio found -- offline mode.\n");
+            }
+        }
     }
 
     /* ---- Init mesh ---- */
     mesh_init(&mesh, radio_online ? &radio : NULL, callsign);
 
-    /* Copy MAC from radio if available, else generate random */
-    if (radio_online) {
-        rtl8811au_priv_t *priv = (rtl8811au_priv_t *)radio.priv;
-        memcpy(mesh.local_mac, priv->local_mac, 6);
+    /* Copy MAC from radio backend.
+     * Both backends put local_mac at a known offset in their priv struct.
+     * We use is_bridge to know which type to cast to. */
+    if (radio_online && radio.priv) {
+        if (is_bridge) {
+            serial_bridge_priv_t *priv = (serial_bridge_priv_t *)radio.priv;
+            memcpy(mesh.local_mac, priv->local_mac, 6);
+        } else {
+            rtl8811au_priv_t *priv = (rtl8811au_priv_t *)radio.priv;
+            memcpy(mesh.local_mac, priv->local_mac, 6);
+        }
     } else {
         /* Random MAC for offline mode */
         uint32_t seed = get_ms();
@@ -93,11 +147,22 @@ int main(int argc, char **argv)
 
         /* Poll radio for incoming frame */
         if (radio_online) {
+            static int rx_count = 0;
+            static int rx_decoded = 0;
+            static uint32_t last_stat = 0;
             uint8_t rx_buf[512];
-            int rx_len = radio.rx_frame(&radio, rx_buf, sizeof(rx_buf), 1);
+            int rx_len = radio.rx_frame(&radio, rx_buf, sizeof(rx_buf), 100);
             if (rx_len > 0) {
-                mesh_process_rx(&mesh, rx_buf, (size_t)rx_len, 0);
-                gui.scroll_to_bottom = 1;
+                rx_count++;
+                int rc = mesh_process_rx(&mesh, rx_buf, (size_t)rx_len, 0);
+                if (rc == 0) {
+                    rx_decoded++;
+                    gui.scroll_to_bottom = 1;
+                }
+            }
+            if (now_ms - last_stat >= 5000) {
+                last_stat = now_ms;
+                printf("[MAIN] RX: %d frames, %d decoded as WiChat\n", rx_count, rx_decoded);
             }
         }
 

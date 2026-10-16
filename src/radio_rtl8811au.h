@@ -27,8 +27,8 @@ static const struct { uint16_t vid; uint16_t pid; const char *name; } RTL_DEVICE
 /* ---- USB transfer timeout (ms) ---- */
 #define RTL_USB_TIMEOUT  1000
 
-/* ---- MAC address register ---- */
-#define RTL_REG_MAC      0x0050
+/* ---- MAC address register (from capture: 0x0610-0x0615) ---- */
+#define RTL_REG_MAC      0x0610
 
 /* ---- Private state ---- */
 typedef struct {

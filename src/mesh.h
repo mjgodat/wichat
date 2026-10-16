@@ -38,6 +38,11 @@ typedef struct {
     radio_t    *radio;
     uint8_t     channel;
     uint8_t     ttl;
+    /* Delayed ACK (avoids collision with sender's FEC burst) */
+    uint32_t    pending_ack_msg_id;
+    uint8_t     pending_ack_dest[6];
+    uint32_t    pending_ack_at_ms;
+    int         has_pending_ack;
 } mesh_t;
 
 /* ---- Public API ---- */

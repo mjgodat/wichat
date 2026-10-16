@@ -1,17 +1,23 @@
 /* mesh.cpp -- WiChat mesh engine for ESP32 CYD
  * Port of PC mesh.c -- calls radio_esp32_tx() directly, uses millis(). */
 #include "mesh.h"
+#include "wspr.h"
 #include "radio_esp32.h"
 #include <string.h>
 #include <stdio.h>
 #include <Arduino.h>
+
+/* FEC context */
+static wspr_ctx_t fec_ctx;
+static int fec_initialized = 0;
+#define FEC_REPETITIONS 3
 
 /* Global mesh instance */
 cyd_mesh_t g_mesh;
 
 /* ---- Static helpers ---- */
 
-static void add_message(const char *sender, const char *text)
+static void add_message(const char *sender, const char *text, uint32_t mid, uint8_t status)
 {
     cyd_mesh_message_t *msg = &g_mesh.messages[g_mesh.msg_head];
     memset(msg, 0, sizeof(*msg));
@@ -23,6 +29,8 @@ static void add_message(const char *sender, const char *text)
     msg->text[WICHAT_MAX_PAYLOAD] = '\0';
 
     msg->timestamp_ms = millis();
+    msg->msg_id = mid;
+    msg->status = status;
 
     g_mesh.msg_head = (g_mesh.msg_head + 1) % WICHAT_MAX_MESSAGES;
     if (g_mesh.msg_count < WICHAT_MAX_MESSAGES)
@@ -70,7 +78,7 @@ static const char *resolve_sender(const uint8_t *mac)
     return hex_buf;
 }
 
-static int mesh_transmit(const wichat_frame_t *frame)
+int mesh_transmit(const wichat_frame_t *frame)
 {
     uint8_t buf[512];
     int n = frame_encode(frame, g_mesh.local_mac, buf, sizeof(buf));
@@ -86,6 +94,8 @@ void cyd_mesh_init(const char *callsign)
     memset(&g_mesh, 0, sizeof(g_mesh));
     g_mesh.channel = WICHAT_DEFAULT_CH;
     g_mesh.ttl     = WICHAT_DEFAULT_TTL;
+    wspr_init(&fec_ctx, 1);
+    fec_initialized = 1;
 
     if (callsign) {
         strncpy(g_mesh.callsign, callsign, WICHAT_MAX_NAME_LEN - 1);
@@ -158,7 +168,28 @@ int cyd_mesh_process_rx(const uint8_t *raw, size_t len, int8_t rssi)
                 copy_len = WICHAT_MAX_PAYLOAD;
             memcpy(text_buf, frame.payload, copy_len);
         }
-        add_message(sender_name, text_buf);
+        add_message(sender_name, text_buf, frame.hdr.msg_id, MSG_STATUS_NONE);
+
+        /* Send ACK back to sender */
+        {
+            wichat_frame_t ack;
+            memset(&ack, 0, sizeof(ack));
+            ack.hdr.magic  = WICHAT_MAGIC;
+            ack.hdr.msg_id = frame_gen_msg_id();
+            ack.hdr.ttl    = g_mesh.ttl;
+            ack.hdr.type   = WICHAT_TYPE_ACK;
+            memcpy(ack.hdr.sender, g_mesh.local_mac, 6);
+            /* ACK payload: original msg_id (4 bytes) + original sender MAC (6 bytes) */
+            ack.payload[0] = (uint8_t)(frame.hdr.msg_id);
+            ack.payload[1] = (uint8_t)(frame.hdr.msg_id >> 8);
+            ack.payload[2] = (uint8_t)(frame.hdr.msg_id >> 16);
+            ack.payload[3] = (uint8_t)(frame.hdr.msg_id >> 24);
+            memcpy(ack.payload + 4, frame.hdr.sender, 6);
+            ack.payload_len = 10;
+            cyd_mesh_mark_seen(ack.hdr.msg_id);
+            mesh_transmit(&ack);
+            Serial.printf("[ACK] Sent ACK for msg %08x\n", frame.hdr.msg_id);
+        }
         break;
     }
 
@@ -180,7 +211,7 @@ int cyd_mesh_process_rx(const uint8_t *raw, size_t len, int8_t rssi)
         char sys_buf[128];
         snprintf(sys_buf, sizeof(sys_buf), "PING from %s (RSSI %d) - PONG sent",
                  from, (int)rssi);
-        add_message("[system]", sys_buf);
+        add_message("[system]", sys_buf, 0, MSG_STATUS_NONE);
         break;
     }
 
@@ -191,12 +222,63 @@ int cyd_mesh_process_rx(const uint8_t *raw, size_t len, int8_t rssi)
             char sys_buf[128];
             snprintf(sys_buf, sizeof(sys_buf), "PONG from %s (RSSI %d)",
                      from, (int)rssi);
-            add_message("[system]", sys_buf);
+            add_message("[system]", sys_buf, 0, MSG_STATUS_NONE);
         }
         cyd_mesh_node_t *node = find_or_add_node(frame.hdr.sender);
         if (node) {
             node->last_seen_ms = millis();
             node->rssi = rssi;
+        }
+        break;
+    }
+
+    case WICHAT_TYPE_ACK: {
+        /* ACK payload: original msg_id (4 bytes) + original sender MAC (6 bytes) */
+        if (frame.payload_len >= 10) {
+            uint32_t acked_id = (uint32_t)frame.payload[0]
+                              | ((uint32_t)frame.payload[1] << 8)
+                              | ((uint32_t)frame.payload[2] << 16)
+                              | ((uint32_t)frame.payload[3] << 24);
+            /* Check if ACK is for us (compare sender MAC in ACK payload to our MAC) */
+            if (memcmp(frame.payload + 4, g_mesh.local_mac, 6) == 0) {
+                /* Find the message and mark as ACKED */
+                for (int i = 0; i < g_mesh.msg_count && i < WICHAT_MAX_MESSAGES; i++) {
+                    int idx = (g_mesh.msg_head - 1 - i + WICHAT_MAX_MESSAGES) % WICHAT_MAX_MESSAGES;
+                    if (g_mesh.messages[idx].msg_id == acked_id &&
+                        g_mesh.messages[idx].status == MSG_STATUS_PENDING) {
+                        g_mesh.messages[idx].status = MSG_STATUS_ACKED;
+                        g_mesh.msg_version++;  /* trigger display refresh */
+                        Serial.printf("[ACK] Message %08x delivered!\n", acked_id);
+                        break;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    case WICHAT_TYPE_FEC_CHUNK: {
+        if (!fec_initialized) { wspr_init(&fec_ctx, 1); fec_initialized = 1; }
+        int fec_rc = wspr_feed_chunk(&fec_ctx, &frame);
+        if (fec_rc == 1) {
+            uint32_t parent_id = 0;
+            if (frame.payload_len >= 4) {
+                parent_id = (uint32_t)frame.payload[0]
+                          | ((uint32_t)frame.payload[1] << 8)
+                          | ((uint32_t)frame.payload[2] << 16)
+                          | ((uint32_t)frame.payload[3] << 24);
+            }
+            if (!cyd_mesh_is_seen(parent_id)) {
+                cyd_mesh_mark_seen(parent_id);
+                uint8_t msg_buf[WICHAT_MAX_PAYLOAD + 1];
+                memset(msg_buf, 0, sizeof(msg_buf));
+                int msg_len = wspr_get_message(&fec_ctx, parent_id,
+                                                msg_buf, WICHAT_MAX_PAYLOAD);
+                if (msg_len > 0) {
+                    const char *sender_name = resolve_sender(frame.hdr.sender);
+                    add_message(sender_name, (const char *)msg_buf, parent_id, MSG_STATUS_NONE);
+                }
+            }
         }
         break;
     }
@@ -229,16 +311,35 @@ int cyd_mesh_send_chat(const char *text)
     frame.hdr.type   = WICHAT_TYPE_CHAT;
     memcpy(frame.hdr.sender, g_mesh.local_mac, 6);
 
-    size_t text_len = strlen(text);
+    size_t text_len = strlen(text) + 1;  /* include null terminator */
     if (text_len > WICHAT_MAX_PAYLOAD)
         text_len = WICHAT_MAX_PAYLOAD;
 
     memcpy(frame.payload, text, text_len);
     frame.payload_len = text_len;
 
-    add_message(g_mesh.callsign, text);
+    add_message(g_mesh.callsign, text, frame.hdr.msg_id, MSG_STATUS_PENDING);
     cyd_mesh_mark_seen(frame.hdr.msg_id);
     mesh_transmit(&frame);
+
+    /* FEC: send 3x redundant chunks */
+    {
+        wspr_tx_t fec_tx;
+        int nchunks = wspr_encode(&fec_tx, (const uint8_t *)text, text_len,
+                                   frame.hdr.msg_id);
+        if (nchunks > 0) {
+            for (int rep = 0; rep < FEC_REPETITIONS; rep++) {
+                for (int ci = 0; ci < nchunks; ci++) {
+                    wichat_frame_t chunk_frame;
+                    if (wspr_build_chunk_frame(&fec_tx, ci, g_mesh.local_mac,
+                                               &chunk_frame) == 0) {
+                        cyd_mesh_mark_seen(chunk_frame.hdr.msg_id);
+                        mesh_transmit(&chunk_frame);
+                    }
+                }
+            }
+        }
+    }
 
     return 0;
 }
@@ -280,7 +381,7 @@ int cyd_mesh_send_ping(void)
     frame.payload_len = 0;
 
     cyd_mesh_mark_seen(frame.hdr.msg_id);
-    add_message("[system]", "PING sent...");
+    add_message("[system]", "PING sent...", 0, MSG_STATUS_NONE);
     mesh_transmit(&frame);
 
     return 0;
@@ -292,6 +393,16 @@ void cyd_mesh_tick(uint32_t now_ms)
     if (now_ms - g_mesh.last_beacon_ms >= WICHAT_BEACON_INTERVAL_MS) {
         cyd_mesh_send_beacon();
         g_mesh.last_beacon_ms = now_ms;
+    }
+
+    /* Mark pending messages as FAILED after 5 seconds with no ACK */
+    for (int i = 0; i < g_mesh.msg_count && i < WICHAT_MAX_MESSAGES; i++) {
+        int idx = (g_mesh.msg_head - 1 - i + WICHAT_MAX_MESSAGES) % WICHAT_MAX_MESSAGES;
+        if (g_mesh.messages[idx].status == MSG_STATUS_PENDING &&
+            now_ms - g_mesh.messages[idx].timestamp_ms > 5000) {
+            g_mesh.messages[idx].status = MSG_STATUS_FAILED;
+            g_mesh.msg_version++;
+        }
     }
 
     /* Expire stale nodes every 10 seconds */
